@@ -135,6 +135,7 @@ class DPT(nn.Module):
         self.encoder_size = encoder_size
         self.patch_size = patch_size
         self.backbone = backbone
+        self._backbone_locked = False
         self.nclass = nclass
         self.in_dims = [self.backbone.embed_dim] * 4
         self.decoder = TPASADDecoder(
@@ -147,12 +148,34 @@ class DPT(nn.Module):
     def lock_backbone(self):
         for p in self.backbone.parameters():
             p.requires_grad = False
+        self._backbone_locked = True
+        self.backbone.eval()
+
+    def train(self, mode=True):
+        """Keep a deliberately frozen DINOv3 backbone in eval mode.
+
+        ``nn.Module.train()`` recursively switches every child to training
+        mode.  That is easy to miss when the encoder is frozen and can still
+        update running-statistics in a backbone variant that contains them.
+        Keeping the state explicit makes the paper-style frozen-backbone
+        profile reproducible and avoids unnecessary activation bookkeeping.
+        """
+        super().train(mode)
+        if self._backbone_locked:
+            self.backbone.eval()
+        return self
 
     def forward(self, x, return_feats=False):
         patch_h, patch_w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
-        feats = self.backbone.get_intermediate_layers(
-            x, n=self.intermediate_layer_idx[self.encoder_size]
-        )
+        if self._backbone_locked:
+            with torch.no_grad():
+                feats = self.backbone.get_intermediate_layers(
+                    x, n=self.intermediate_layer_idx[self.encoder_size]
+                )
+        else:
+            feats = self.backbone.get_intermediate_layers(
+                x, n=self.intermediate_layer_idx[self.encoder_size]
+            )
 
         out = self.decoder(feats, patch_h, patch_w)
         out = F.interpolate(out, size=x.shape[-2:], mode='bilinear', align_corners=False)

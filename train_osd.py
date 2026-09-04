@@ -1,0 +1,423 @@
+"""Train/evaluate the current SegDINO-v2 decoder on OSD.
+
+This runner is intentionally separate from the upstream binary medical-data
+runner.  It has an explicit four-class CE objective and an explicit OSD
+L4-global evaluator so that input/training profiles can change without
+changing the cross-model metric.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from config_loader import ModelConfig
+from osd_dataset import OSDDataset, build_osd_transform
+from osd_metrics import confusion_from_logits, l4_global_metrics, make_l4_payload, write_l4_payload
+from runtime import build_model, summarize_parameters
+
+
+ROOT_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else (ROOT_DIR / path).resolve()
+
+
+def _load_config(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _normalize_input_size(value: Any) -> tuple[int, int]:
+    if isinstance(value, int):
+        size = (value, value)
+    elif isinstance(value, (list, tuple)) and len(value) == 2:
+        size = (int(value[0]), int(value[1]))
+    else:
+        raise ValueError("input_size must be an integer or [height, width]")
+    if min(size) <= 0:
+        raise ValueError(f"Invalid input_size: {value}")
+    return size
+
+
+def _input_size_metadata(size: tuple[int, int]) -> int | list[int]:
+    return size[0] if size[0] == size[1] else [size[0], size[1]]
+
+
+def _seed_everything(seed: int, deterministic: bool, cudnn_benchmark: bool) -> None:
+    if deterministic and cudnn_benchmark:
+        raise ValueError("deterministic=True and cudnn_benchmark=True are contradictory")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
+    torch.use_deterministic_algorithms(bool(deterministic), warn_only=True)
+
+
+def _make_loader(
+    data_root: Path,
+    split: str,
+    input_size: tuple[int, int],
+    train: bool,
+    batch_size: int,
+    workers: int,
+    config: dict[str, Any],
+    device: torch.device,
+    persistent_workers: bool = False,
+) -> DataLoader:
+    transform = build_osd_transform(
+        input_size,
+        train=train,
+        augment=config.get("augmentation", {}) if train else None,
+        resize_mode=config.get("preprocessing", {}).get("resize_mode", "stretch"),
+        ignore_index=int(config["ignore_index"]),
+    )
+    dataset = OSDDataset(
+        data_root,
+        split=split,
+        transform=transform,
+        num_classes=int(config["num_classes"]),
+        ignore_index=int(config["ignore_index"]),
+    )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": train,
+        "num_workers": workers,
+        "pin_memory": device.type == "cuda",
+        "drop_last": False,
+    }
+    if workers > 0:
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        # Do not fork workers after a CUDA model has been constructed.  A
+        # forked CUDA context can corrupt memory statistics and is unsafe for
+        # later CUDA work; spawn gives each worker a clean interpreter.
+        loader_kwargs["multiprocessing_context"] = "spawn"
+    return DataLoader(dataset, **loader_kwargs)
+
+
+@torch.inference_mode()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_classes: int,
+    ignore_index: int,
+    max_batches: Optional[int] = None,
+) -> tuple[dict[str, float], np.ndarray, int]:
+    model.eval()
+    confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+    images = 0
+    for batch_index, (inputs, targets, _) in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        logits = model(inputs.to(device, non_blocking=True))
+        confusion += confusion_from_logits(logits, targets, num_classes, ignore_index)
+        images += inputs.shape[0]
+    return l4_global_metrics(confusion), confusion, images
+
+
+def _save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    epoch: int,
+    metrics: Optional[dict[str, float]],
+    config: dict[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "epoch": epoch,
+            "metrics": metrics,
+            "config": config,
+        },
+        path,
+    )
+
+
+def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> dict[str, Any]:
+    runtime = config.get("runtime", {})
+    seed = int(runtime.get("seed", 20260901))
+    deterministic = bool(runtime.get("deterministic", False))
+    cudnn_benchmark = bool(runtime.get("cudnn_benchmark", False))
+    if cudnn_benchmark and not bool(runtime.get("allow_large_cudnn_workspace", False)):
+        raise ValueError(
+            "cudnn_benchmark=True is blocked by default for SegDINO-v2 because "
+            "it can select a multi-GiB convolution workspace. Set the explicit "
+            "runtime.allow_large_cudnn_workspace=true only after a memory probe."
+        )
+    _seed_everything(seed, deterministic, cudnn_benchmark)
+
+    data_root = _resolve_path(config["data_root"])
+    input_size = _normalize_input_size(config["input_size"])
+    num_classes = int(config["num_classes"])
+    ignore_index = int(config["ignore_index"])
+    training = config["training"]
+    model_config = config["model"]
+    patch_size = int(model_config.get("patch_size", 16))
+    if any(dimension % patch_size != 0 for dimension in input_size):
+        raise ValueError(
+            f"input_size={input_size} must be divisible by DINO patch_size={patch_size}; "
+            "otherwise border pixels are silently dropped by patch embedding"
+        )
+    model_cfg = ModelConfig(
+        dino_size=model_config["dino_size"],
+        dino_repo=str(_resolve_path(model_config["dino_repo"])),
+        dino_ckpt=str(_resolve_path(model_config["dino_ckpt"])),
+        decoder_dim=int(model_config["decoder_dim"]),
+        use_bn=bool(model_config.get("use_bn", False)),
+        num_classes=num_classes,
+        patch_size=patch_size,
+    )
+
+    worker_count = 0 if smoke else int(training.get("workers", 4))
+    train_loader = _make_loader(
+        data_root, config.get("train_split", "train"), input_size, True,
+        int(training["batch_size"]), worker_count, config, device,
+        persistent_workers=True,
+    )
+    val_loader = _make_loader(
+        data_root, config.get("val_split", "val"), input_size, False,
+        int(training.get("eval_batch_size", 1)), worker_count, config, device,
+        persistent_workers=True,
+    )
+    test_loader = None
+    selection_split = config.get("selection_split", "val")
+    if selection_split not in {"val", "test"}:
+        raise ValueError("selection_split must be 'val' or 'test'")
+    selection_loader = val_loader
+    if selection_split == "test":
+        print("WARNING: selection_split=test; resulting metrics are development/test-tuned, not untouched-test results.")
+        test_loader = _make_loader(
+            data_root, config.get("test_split", "test"), input_size, False,
+            int(training.get("eval_batch_size", 1)), worker_count, config, device,
+            persistent_workers=True,
+        )
+        selection_loader = test_loader
+
+    model, backbone = build_model(model_cfg, str(device))
+    if bool(model_config.get("freeze_backbone", True)):
+        model.lock_backbone()
+    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters remain after applying freeze_backbone")
+
+    optimizer_cfg = config["optimizer"]
+    if optimizer_cfg.get("name", "AdamW") != "AdamW":
+        raise ValueError("This runner currently supports only the explicit AdamW optimizer")
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=float(optimizer_cfg["lr"]),
+        betas=tuple(float(value) for value in optimizer_cfg.get("betas", [0.9, 0.999])),
+        weight_decay=float(optimizer_cfg["weight_decay"]),
+    )
+    scheduler_cfg = config.get("scheduler")
+    if not isinstance(scheduler_cfg, dict) or scheduler_cfg.get("name") != "constant":
+        raise ValueError(
+            "Set scheduler.name='constant' explicitly for the upstream SegDINO profile; "
+            "other schedules are not silently inferred"
+        )
+    loss_cfg = config.get("loss")
+    if not isinstance(loss_cfg, dict) or loss_cfg.get("name") != "CrossEntropyLoss":
+        raise ValueError(
+            "Set loss.name='CrossEntropyLoss' explicitly for mutually exclusive OSD labels"
+        )
+    criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
+    amp_enabled = bool(runtime.get("amp", False)) and device.type == "cuda"
+    amp_dtype_name = runtime.get("amp_dtype", "float16")
+    if amp_dtype_name not in {"float16", "bfloat16"}:
+        raise ValueError("runtime.amp_dtype must be 'float16' or 'bfloat16'")
+    amp_dtype = torch.float16 if amp_dtype_name == "float16" else torch.bfloat16
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+    total_params, backbone_params, decoder_params = summarize_parameters(model, backbone)
+    trainable_count = sum(parameter.numel() for parameter in trainable_params)
+    print(
+        f"model={config.get('name', 'unnamed')} input={input_size[0]}x{input_size[1]} "
+        f"device={device} selection_split={selection_split}"
+    )
+    print(
+        f"params total={total_params / 1e6:.3f}M backbone={backbone_params / 1e6:.3f}M "
+        f"decoder={decoder_params / 1e6:.3f}M trainable={trainable_count / 1e6:.3f}M"
+    )
+    print(
+        f"optimizer=AdamW lr={optimizer_cfg['lr']} weight_decay={optimizer_cfg['weight_decay']} "
+        f"scheduler=constant "
+        f"loss=CrossEntropyLoss ignore_index={ignore_index} freeze_backbone={model_config.get('freeze_backbone', True)} "
+        f"amp={amp_enabled} deterministic={deterministic} cudnn_benchmark={cudnn_benchmark}"
+    )
+
+    run_dir = _resolve_path(config.get("run_dir", "./runs/osd"))
+    if smoke:
+        run_dir = run_dir / "smoke"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+    epochs = training.get("epochs")
+    max_iters = training.get("max_iters")
+    if max_iters is None:
+        if epochs is None:
+            raise ValueError("Set either training.epochs or training.max_iters")
+        max_iters = int(epochs) * len(train_loader)
+    max_iters = int(max_iters)
+    if smoke:
+        max_iters = 1
+    val_interval = training.get("val_interval_steps")
+    if val_interval is None:
+        val_interval = len(train_loader)
+    val_interval = 1 if smoke else int(val_interval)
+    max_eval_batches = 1 if smoke else training.get("max_eval_batches")
+    history: list[dict[str, Any]] = []
+    best_value = float("-inf")
+    best_path = run_dir / "best.pth"
+    latest_path = run_dir / "latest.pth"
+    loader_iter = iter(train_loader)
+    start_time = time.perf_counter()
+    last_log_time = start_time
+    log_interval = max(1, int(training.get("log_interval_steps", 50)))
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+    for step in range(1, max_iters + 1):
+        try:
+            inputs, targets, _ = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(train_loader)
+            inputs, targets, _ = next(loader_iter)
+        model.train()
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            logits = model(inputs)
+            if logits.shape[-2:] != targets.shape[-2:]:
+                raise ValueError(f"Output/target shape mismatch: {logits.shape} vs {targets.shape}")
+            loss = criterion(logits, targets)
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
+
+        if step == 1 or step % log_interval == 0:
+            now = time.perf_counter()
+            elapsed = now - start_time
+            interval_seconds = now - last_log_time
+            steps_since_log = 1 if step == 1 else log_interval
+            step_seconds = interval_seconds / steps_since_log
+            eta_seconds = max(0.0, (max_iters - step) * (elapsed / step))
+            print(
+                f"step={step}/{max_iters} loss={float(loss.detach().cpu()):.5f} "
+                f"lr={optimizer.param_groups[0]['lr']:.8g} "
+                f"step_sec={step_seconds:.3f} eta_min={eta_seconds / 60.0:.1f}"
+            )
+            last_log_time = now
+
+        should_validate = step == max_iters or step % val_interval == 0
+        if should_validate:
+            selection_metrics, confusion, evaluated_images = evaluate(
+                model, selection_loader, device, num_classes, ignore_index, max_eval_batches
+            )
+            record = {
+                "step": step,
+                "epoch": int((step - 1) // len(train_loader) + 1),
+                "train_loss": float(loss.detach().cpu()),
+                "selection_split": selection_split,
+                "selection_metrics": selection_metrics,
+                "evaluated_images": evaluated_images,
+            }
+            history.append(record)
+            print(
+                f"step={step}/{max_iters} loss={record['train_loss']:.5f} "
+                f"{selection_split}_mIoU3={selection_metrics['mIoU3_report_only_global']:.4f}%"
+            )
+            _save_checkpoint(
+                latest_path, model, optimizer, step, record["epoch"], selection_metrics, config
+            )
+            score = selection_metrics["mIoU3_report_only_global"]
+            if np.isfinite(score) and score > best_value:
+                best_value = score
+                _save_checkpoint(
+                    best_path, model, optimizer, step, record["epoch"], selection_metrics, config
+                )
+            payload = make_l4_payload(
+                confusion,
+                split=selection_split,
+                input_size=_input_size_metadata(input_size),
+                protocol_id=config.get("protocol_id", "OSD-EXP-v1.0/L4-global-512"),
+                model_name=config.get("name"),
+                evaluated_images=evaluated_images,
+                selection_split=selection_split,
+            )
+            write_l4_payload(payload, run_dir / f"{selection_split}_step_{step:06d}.json")
+
+    (run_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
+    elapsed = time.perf_counter() - start_time
+    summary = {
+        "run_dir": str(run_dir),
+        "max_iters": max_iters,
+        "elapsed_seconds": elapsed,
+        "best_selection_mIoU3_report_only_global": best_value,
+        "selection_split": selection_split,
+        "best_checkpoint": str(best_path) if best_path.exists() else None,
+        "latest_checkpoint": str(latest_path) if latest_path.exists() else None,
+        "params_total": total_params,
+        "params_backbone": backbone_params,
+        "params_decoder": decoder_params,
+        "params_trainable": trainable_count,
+        "peak_memory_mib": round(
+            torch.cuda.max_memory_allocated(device) / 1024**2, 2
+        ) if device.type == "cuda" else None,
+        "config": config,
+    }
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--device", default=None, help="e.g. cuda or cpu; defaults to config/auto")
+    parser.add_argument("--smoke", action="store_true", help="one real OSD train batch plus one eval batch")
+    parser.add_argument("--max-iters", type=int, default=None, help="explicit short-run override")
+    parser.add_argument("--workers", type=int, default=None, help="explicit DataLoader worker override")
+    parser.add_argument("--selection-split", choices=("val", "test"), default=None)
+    parser.add_argument("--run-dir", default=None, help="explicit output directory override")
+    args = parser.parse_args()
+    config = _load_config(args.config)
+    if args.max_iters is not None:
+        config["training"]["max_iters"] = args.max_iters
+        config["training"]["epochs"] = None
+    if args.workers is not None:
+        config["training"]["workers"] = args.workers
+    if args.selection_split is not None:
+        config["selection_split"] = args.selection_split
+    if args.run_dir is not None:
+        config["run_dir"] = args.run_dir
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device(config.get("runtime", {}).get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    run(config, device, smoke=args.smoke)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,64 @@
+{
+  "date": "2026-09-04",
+  "scope": "validation development screen; test not evaluated",
+  "dataset_counts": {
+    "train": 811,
+    "val": 203,
+    "test": 254,
+    "approximately_16_9": 1263,
+    "total": 1268
+  },
+  "common": {
+    "backbone": "DINOv3-S/16 frozen",
+    "batch_size": 8,
+    "optimizer": "AdamW",
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "scheduler": "constant",
+    "loss": "CrossEntropyLoss",
+    "seed": 20260901,
+    "amp": false,
+    "cudnn_benchmark": false,
+    "params_total": 24901516,
+    "params_trainable": 3300364
+  },
+  "runs": {
+    "square_512_500": {
+      "best_step": 408,
+      "mIoU3_report_only_global_percent": 85.212006,
+      "IoU_oil_percent": 82.04411,
+      "IoU_water_percent": 77.338719,
+      "IoU_others_percent": 96.253188,
+      "IoU_background_percent": 16.816256,
+      "elapsed_seconds": 138.6429303289915,
+      "peak_memory_mib": 11316.21
+    },
+    "native_512x896_500": {
+      "best_step": 500,
+      "mIoU3_report_only_global_percent": 85.364094,
+      "IoU_oil_percent": 82.086333,
+      "IoU_water_percent": 76.9902,
+      "IoU_others_percent": 97.015748,
+      "IoU_background_percent": 21.472467,
+      "elapsed_seconds": 240.44080881000264,
+      "peak_memory_mib": 19707.34
+    },
+    "square_512_1000": {
+      "best_step": 918,
+      "mIoU3_report_only_global_percent": 87.426981,
+      "mIoU4_all_classes_global_percent": 73.41932,
+      "IoU_oil_percent": 84.836287,
+      "IoU_water_percent": 80.642037,
+      "IoU_others_percent": 96.80262,
+      "IoU_background_percent": 31.396336,
+      "elapsed_seconds": 274.98698041800526,
+      "peak_memory_mib": 11316.21
+    }
+  },
+  "reference": {
+    "name": "SegFormer-B0 seed 20260901 iter 38000",
+    "split": "val",
+    "mIoU3_report_only_global_percent": 91.369951
+  },
+  "recommendation": "Use 512x512 for the first full 50-epoch run; retain 512x896 as an input-strategy ablation."
+}

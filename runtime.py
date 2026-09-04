@@ -1,3 +1,6 @@
+import importlib
+import sys
+from pathlib import Path
 from typing import Tuple
 
 import torch
@@ -11,13 +14,41 @@ def get_device() -> str:
 
 
 def load_backbone(model_config: ModelConfig):
-    model_name = "dinov3_vitb16" if model_config.dino_size == "b" else "dinov3_vits16"
-    return torch.hub.load(
-        model_config.dino_repo,
-        model_name,
-        source="local",
-        weights=model_config.dino_ckpt,
-    )
+    """Load only the requested DINOv3 backbone from a local checkout.
+
+    The official ``hubconf.py`` imports optional classifier/detector/segmentor
+    modules as well as the backbone.  Those optional modules can require a
+    newer PyTorch API than the backbone itself, so using ``torch.hub.load``
+    makes an otherwise valid backbone environment fail during import.  Import
+    the backbone factory directly and pass the local checkpoint to it instead.
+    """
+    repo = Path(model_config.dino_repo).expanduser().resolve()
+    if not (repo / "dinov3").is_dir():
+        raise FileNotFoundError(f"DINOv3 source directory not found: {repo}")
+    checkpoint = Path(model_config.dino_ckpt).expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"DINOv3 checkpoint not found: {checkpoint}")
+
+    # The DINOv3 checkout is intentionally external to this repository.  Add
+    # it only when needed so the same SegDINO source can point at Project2 or
+    # another official checkout without copying model code into this repo.
+    repo_str = str(repo)
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
+
+    backbones = importlib.import_module("dinov3.hub.backbones")
+    try:
+        constructor = {
+            "s": backbones.dinov3_vits16,
+            "b": backbones.dinov3_vitb16,
+        }[model_config.dino_size]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported dino_size '{model_config.dino_size}'. "
+            "The current adapter supports 's' and 'b'."
+        ) from exc
+
+    return constructor(pretrained=True, weights=str(checkpoint))
 
 
 def build_model(model_config: ModelConfig, device: str) -> Tuple[torch.nn.Module, torch.nn.Module]:

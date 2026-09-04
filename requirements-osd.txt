@@ -1,0 +1,18 @@
+# Install the CUDA wheels with the cu118 index used on this machine.
+torch==2.2.0
+torchvision==0.17.0
+numpy==1.26.4
+Pillow==12.3.0
+tqdm==4.66.5
+
+# Optional dependencies used by the upstream binary-dataset test script or
+# by the full official DINOv3 training code; the OSD runner does not import
+# them and intentionally avoids pulling their extra dependency tree.
+# scipy
+# ftfy
+# omegaconf
+# regex
+# scikit-learn
+# submitit
+# termcolor
+# torchmetrics
