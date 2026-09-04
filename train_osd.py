@@ -213,7 +213,8 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         selection_loader = test_loader
 
     model, backbone = build_model(model_cfg, str(device))
-    if bool(model_config.get("freeze_backbone", True)):
+    freeze_backbone = bool(model_config.get("freeze_backbone", True))
+    if freeze_backbone:
         model.lock_backbone()
     trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable_params:
@@ -222,9 +223,25 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
     optimizer_cfg = config["optimizer"]
     if optimizer_cfg.get("name", "AdamW") != "AdamW":
         raise ValueError("This runner currently supports only the explicit AdamW optimizer")
+
+    base_lr = float(optimizer_cfg["lr"])
+    backbone_lr = optimizer_cfg.get("backbone_lr")
+    backbone_lr_mult = optimizer_cfg.get("backbone_lr_mult")
+    if backbone_lr is None and backbone_lr_mult is not None:
+        backbone_lr = base_lr * float(backbone_lr_mult)
+
+    if not freeze_backbone and backbone_lr is not None:
+        backbone_params = [p for p in model.backbone.parameters() if p.requires_grad]
+        decoder_params = [p for p in model.decoder.parameters() if p.requires_grad]
+        param_groups = [
+            {"params": backbone_params, "lr": float(backbone_lr)},
+            {"params": decoder_params, "lr": base_lr},
+        ]
+    else:
+        param_groups = [{"params": trainable_params, "lr": base_lr}]
+
     optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=float(optimizer_cfg["lr"]),
+        param_groups,
         betas=tuple(float(value) for value in optimizer_cfg.get("betas", [0.9, 0.999])),
         weight_decay=float(optimizer_cfg["weight_decay"]),
     )
@@ -270,10 +287,13 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         f"params total={total_params / 1e6:.3f}M backbone={backbone_params / 1e6:.3f}M "
         f"decoder={decoder_params / 1e6:.3f}M trainable={trainable_count / 1e6:.3f}M"
     )
+    if not freeze_backbone and backbone_lr is not None:
+        opt_info = f"optimizer=AdamW lr_decoder={base_lr} lr_backbone={float(backbone_lr)} weight_decay={optimizer_cfg['weight_decay']}"
+    else:
+        opt_info = f"optimizer=AdamW lr={optimizer_cfg['lr']} weight_decay={optimizer_cfg['weight_decay']}"
     log_print(
-        f"optimizer=AdamW lr={optimizer_cfg['lr']} weight_decay={optimizer_cfg['weight_decay']} "
-        f"scheduler={scheduler_name} "
-        f"loss=CrossEntropyLoss ignore_index={ignore_index} freeze_backbone={model_config.get('freeze_backbone', True)} "
+        f"{opt_info} scheduler={scheduler_name} "
+        f"loss=CrossEntropyLoss ignore_index={ignore_index} freeze_backbone={freeze_backbone} "
         f"amp={amp_enabled} deterministic={deterministic} cudnn_benchmark={cudnn_benchmark}"
     )
 
@@ -360,9 +380,13 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
             steps_since_log = 1 if step == 1 else log_interval
             step_seconds = interval_seconds / steps_since_log
             eta_seconds = max(0.0, (max_iters - step) * (elapsed / step))
+            if len(optimizer.param_groups) > 1:
+                lr_str = f"lr_dec={optimizer.param_groups[1]['lr']:.6g} lr_bb={optimizer.param_groups[0]['lr']:.6g}"
+            else:
+                lr_str = f"lr={optimizer.param_groups[0]['lr']:.8g}"
             log_print(
                 f"step={step}/{max_iters} loss={loss_val:.5f} "
-                f"lr={optimizer.param_groups[0]['lr']:.8g} "
+                f"{lr_str} "
                 f"step_sec={step_seconds:.3f} eta_min={eta_seconds / 60.0:.1f}"
             )
             last_log_time = now
@@ -375,7 +399,7 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
             epoch_mean_loss = running_loss_sum / max(1, running_loss_count)
             running_loss_sum = 0.0
             running_loss_count = 0
-            cur_lr = float(optimizer.param_groups[0]["lr"])
+            cur_lr = float(optimizer.param_groups[-1]["lr"])
             epoch_idx = int((step - 1) // len(train_loader) + 1)
             record = {
                 "step": step,
@@ -388,8 +412,12 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
                 "evaluated_images": evaluated_images,
             }
             history.append(record)
+            if len(optimizer.param_groups) > 1:
+                epoch_lr_str = f"LR_dec={optimizer.param_groups[1]['lr']:.6g} LR_bb={optimizer.param_groups[0]['lr']:.6g}"
+            else:
+                epoch_lr_str = f"LR={cur_lr:.6g}"
             log_print(
-                f"[Epoch {epoch_idx:02d} | Step {step:04d}/{max_iters}] LR={cur_lr:.6g} | "
+                f"[Epoch {epoch_idx:02d} | Step {step:04d}/{max_iters}] {epoch_lr_str} | "
                 f"Mean Train Loss={epoch_mean_loss:.5f} | "
                 f"{selection_split}_mIoU3={selection_metrics['mIoU3_report_only_global']:.4f}% | "
                 f"Oil={selection_metrics['IoU_oil_global']:.2f}% | "
