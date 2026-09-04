@@ -185,6 +185,7 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         use_bn=bool(model_config.get("use_bn", False)),
         num_classes=num_classes,
         patch_size=patch_size,
+        layer_mapping=model_config.get("layer_mapping"),
     )
 
     worker_count = 0 if smoke else int(training.get("workers", 4))
@@ -296,6 +297,8 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         f"loss=CrossEntropyLoss ignore_index={ignore_index} freeze_backbone={freeze_backbone} "
         f"amp={amp_enabled} deterministic={deterministic} cudnn_benchmark={cudnn_benchmark}"
     )
+    if model_config.get("layer_mapping") is not None:
+        log_print(f"layer_mapping={model_config['layer_mapping']} (reversed/permuted routing)")
 
     epochs = training.get("epochs")
     max_iters = training.get("max_iters")

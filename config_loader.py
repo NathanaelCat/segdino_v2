@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Optional
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -23,6 +26,7 @@ class ModelConfig:
     use_bn: bool = False
     num_classes: int = 1
     patch_size: int = 16
+    layer_mapping: Optional[list[int]] = None
 
 
 @dataclass(frozen=True)

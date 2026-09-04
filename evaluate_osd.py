@@ -43,6 +43,7 @@ def main() -> None:
         use_bn=bool(model_config.get("use_bn", False)),
         num_classes=int(config["num_classes"]),
         patch_size=int(model_config.get("patch_size", 16)),
+        layer_mapping=model_config.get("layer_mapping"),
     )
     model, _ = build_model(model_cfg, str(device))
     if bool(model_config.get("freeze_backbone", True)):

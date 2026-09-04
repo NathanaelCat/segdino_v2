@@ -60,6 +60,7 @@ def build_model(model_config: ModelConfig, device: str) -> Tuple[torch.nn.Module
         use_bn=model_config.use_bn,
         patch_size=model_config.patch_size,
         backbone=backbone,
+        layer_mapping=getattr(model_config, "layer_mapping", None),
     ).to(device)
     return model, backbone
 

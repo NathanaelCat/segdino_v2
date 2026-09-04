@@ -123,6 +123,7 @@ class DPT(nn.Module):
         patch_size=16,
         use_bn=False,
         backbone=None,
+        layer_mapping=None,
     ):
         super(DPT, self).__init__()
 
@@ -135,6 +136,7 @@ class DPT(nn.Module):
         self.encoder_size = encoder_size
         self.patch_size = patch_size
         self.backbone = backbone
+        self.layer_mapping = list(layer_mapping) if layer_mapping is not None else None
         self._backbone_locked = False
         self.nclass = nclass
         self.in_dims = [self.backbone.embed_dim] * 4
@@ -176,6 +178,9 @@ class DPT(nn.Module):
             feats = self.backbone.get_intermediate_layers(
                 x, n=self.intermediate_layer_idx[self.encoder_size]
             )
+
+        if self.layer_mapping is not None:
+            feats = [feats[i] for i in self.layer_mapping]
 
         out = self.decoder(feats, patch_h, patch_w)
         out = F.interpolate(out, size=x.shape[-2:], mode='bilinear', align_corners=False)
