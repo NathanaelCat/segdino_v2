@@ -27,6 +27,10 @@ class ModelConfig:
     num_classes: int = 1
     patch_size: int = 16
     layer_mapping: Optional[list[int]] = None
+    adaptive_readout: bool = False
+    readout_mode: str = "matrix"
+    readout_init: str = "uniform"
+    readout_temperature: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -106,6 +110,11 @@ def _build_model_config(overrides):
         use_bn=overrides.get("use_bn", BASE_MODEL.use_bn),
         num_classes=overrides.get("num_classes", BASE_MODEL.num_classes),
         patch_size=overrides.get("patch_size", BASE_MODEL.patch_size),
+        layer_mapping=overrides.get("layer_mapping", BASE_MODEL.layer_mapping),
+        adaptive_readout=overrides.get("adaptive_readout", BASE_MODEL.adaptive_readout),
+        readout_mode=overrides.get("readout_mode", BASE_MODEL.readout_mode),
+        readout_init=overrides.get("readout_init", BASE_MODEL.readout_init),
+        readout_temperature=overrides.get("readout_temperature", BASE_MODEL.readout_temperature),
     )
 
 

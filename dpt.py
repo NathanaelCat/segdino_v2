@@ -38,8 +38,92 @@ class TPAResampleProject(nn.Module):
         return self.conv(x)
 
 
+class AdaptiveLayerScaleReadout(nn.Module):
+    """Adaptive Layer-Scale Readout (ALSR).
+
+    Instead of a fixed 1-to-1 mapping from intermediate DINO layers to decoder
+    pyramid scales, ALSR aggregates features across all layers for each scale:
+        F_s = sum_{i=0}^{N-1} alpha_{s, i} * P_i(feat_i)
+    where alpha_{s, :} = softmax(W_{s, :} / tau).
+    """
+
+    def __init__(
+        self,
+        num_layers: int = 4,
+        num_scales: int = 4,
+        mode: str = "matrix",
+        init_mode: str = "uniform",
+        temperature: float = 1.0,
+        channels: int = 128,
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.num_scales = num_scales
+        self.mode = mode
+        self.temperature = float(temperature)
+
+        if mode == "uniform":
+            self.register_buffer("weight_logits", torch.zeros(num_scales, num_layers))
+        elif mode == "matrix":
+            if init_mode == "identity":
+                weights = torch.eye(num_scales, num_layers) * 2.0
+            else:
+                weights = torch.zeros(num_scales, num_layers)
+            self.weight_logits = nn.Parameter(weights)
+        elif mode == "dynamic":
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.mlp = nn.Sequential(
+                nn.Linear(num_layers * channels, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, num_scales * num_layers),
+            )
+            nn.init.zeros_(self.mlp[-1].weight)
+            nn.init.zeros_(self.mlp[-1].bias)
+        else:
+            raise ValueError(f"Unknown ALSR mode: {mode}")
+
+    def get_routing_weights(self, projected_feats=None) -> torch.Tensor:
+        if self.mode in ("matrix", "uniform"):
+            return F.softmax(self.weight_logits / self.temperature, dim=-1)
+        elif self.mode == "dynamic":
+            if projected_feats is None:
+                raise ValueError("Dynamic ALSR requires projected_feats to compute weights")
+            B = projected_feats[0].shape[0]
+            pooled = torch.cat([self.pool(f).flatten(1) for f in projected_feats], dim=1)
+            logits = self.mlp(pooled).view(B, self.num_scales, self.num_layers)
+            return F.softmax(logits / self.temperature, dim=-1)
+
+    def forward(self, projected_feats: list) -> list:
+        assert len(projected_feats) == self.num_layers
+        weights = self.get_routing_weights(projected_feats)
+        stacked = torch.stack(projected_feats, dim=1)
+
+        out_scales = []
+        if self.mode in ("matrix", "uniform"):
+            for s in range(self.num_scales):
+                w_s = weights[s].view(1, self.num_layers, 1, 1, 1)
+                f_s = (stacked * w_s).sum(dim=1)
+                out_scales.append(f_s)
+        else:
+            for s in range(self.num_scales):
+                w_s = weights[:, s, :].view(-1, self.num_layers, 1, 1, 1)
+                f_s = (stacked * w_s).sum(dim=1)
+                out_scales.append(f_s)
+        return out_scales
+
+
 class TPASADDecoder(nn.Module):
-    def __init__(self, in_dims, decoder_channels=128, num_classes=2, use_group_norm=True):
+    def __init__(
+        self,
+        in_dims,
+        decoder_channels=128,
+        num_classes=2,
+        use_group_norm=True,
+        adaptive_readout=False,
+        readout_mode="matrix",
+        readout_init="uniform",
+        readout_temperature=1.0,
+    ):
         super().__init__()
         assert len(in_dims) == 4
 
@@ -48,6 +132,18 @@ class TPASADDecoder(nn.Module):
         self.token_projections = nn.ModuleList(
             [nn.Conv2d(channels, decoder_channels, 1, bias=False) for channels in in_dims]
         )
+        if adaptive_readout:
+            self.alsr = AdaptiveLayerScaleReadout(
+                num_layers=len(in_dims),
+                num_scales=4,
+                mode=readout_mode,
+                init_mode=readout_init,
+                temperature=readout_temperature,
+                channels=decoder_channels,
+            )
+        else:
+            self.alsr = None
+
         self.tpa_branch_1 = TPAResampleProject(decoder_channels, scale_factor=8)
         self.tpa_branch_2 = TPAResampleProject(decoder_channels, scale_factor=4)
         self.tpa_branch_3 = TPAResampleProject(decoder_channels, scale_factor=2)
@@ -90,6 +186,9 @@ class TPASADDecoder(nn.Module):
             feature_map = self.token_projections[index](feature_map)
             branches.append(feature_map)
 
+        if self.alsr is not None:
+            branches = self.alsr(branches)
+
         branch_1 = self.tpa_branch_1(branches[0])
         branch_2 = self.tpa_branch_2(branches[1])
         branch_3 = self.tpa_branch_3(branches[2])
@@ -124,6 +223,10 @@ class DPT(nn.Module):
         use_bn=False,
         backbone=None,
         layer_mapping=None,
+        adaptive_readout=False,
+        readout_mode="matrix",
+        readout_init="uniform",
+        readout_temperature=1.0,
     ):
         super(DPT, self).__init__()
 
@@ -145,7 +248,16 @@ class DPT(nn.Module):
             decoder_channels=decoder_channels,
             num_classes=self.nclass,
             use_group_norm=not use_bn,
+            adaptive_readout=adaptive_readout,
+            readout_mode=readout_mode,
+            readout_init=readout_init,
+            readout_temperature=readout_temperature,
         )
+
+    def get_routing_weights(self):
+        if hasattr(self.decoder, "alsr") and self.decoder.alsr is not None:
+            return self.decoder.alsr.get_routing_weights()
+        return None
 
     def lock_backbone(self):
         for p in self.backbone.parameters():

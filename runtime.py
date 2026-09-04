@@ -61,6 +61,10 @@ def build_model(model_config: ModelConfig, device: str) -> Tuple[torch.nn.Module
         patch_size=model_config.patch_size,
         backbone=backbone,
         layer_mapping=getattr(model_config, "layer_mapping", None),
+        adaptive_readout=getattr(model_config, "adaptive_readout", False),
+        readout_mode=getattr(model_config, "readout_mode", "matrix"),
+        readout_init=getattr(model_config, "readout_init", "uniform"),
+        readout_temperature=getattr(model_config, "readout_temperature", 1.0),
     ).to(device)
     return model, backbone
 

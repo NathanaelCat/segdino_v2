@@ -44,6 +44,10 @@ def main() -> None:
         num_classes=int(config["num_classes"]),
         patch_size=int(model_config.get("patch_size", 16)),
         layer_mapping=model_config.get("layer_mapping"),
+        adaptive_readout=bool(model_config.get("adaptive_readout", False)),
+        readout_mode=str(model_config.get("readout_mode", "matrix")),
+        readout_init=str(model_config.get("readout_init", "uniform")),
+        readout_temperature=float(model_config.get("readout_temperature", 1.0)),
     )
     model, _ = build_model(model_cfg, str(device))
     if bool(model_config.get("freeze_backbone", True)):

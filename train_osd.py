@@ -186,6 +186,10 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         num_classes=num_classes,
         patch_size=patch_size,
         layer_mapping=model_config.get("layer_mapping"),
+        adaptive_readout=bool(model_config.get("adaptive_readout", False)),
+        readout_mode=str(model_config.get("readout_mode", "matrix")),
+        readout_init=str(model_config.get("readout_init", "uniform")),
+        readout_temperature=float(model_config.get("readout_temperature", 1.0)),
     )
 
     worker_count = 0 if smoke else int(training.get("workers", 4))
@@ -299,6 +303,11 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
     )
     if model_config.get("layer_mapping") is not None:
         log_print(f"layer_mapping={model_config['layer_mapping']} (reversed/permuted routing)")
+    if model_cfg.adaptive_readout:
+        log_print(
+            f"adaptive_readout=True mode={model_cfg.readout_mode} "
+            f"init={model_cfg.readout_init} tau={model_cfg.readout_temperature}"
+        )
 
     epochs = training.get("epochs")
     max_iters = training.get("max_iters")
@@ -335,6 +344,7 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
     max_eval_batches = 1 if smoke else training.get("max_eval_batches")
     history: list[dict[str, Any]] = []
     best_value = float("-inf")
+    best_routing_weights = None
     best_path = run_dir / "best.pth"
     latest_path = run_dir / "latest.pth"
     loader_iter = iter(train_loader)
@@ -414,6 +424,10 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
                 "selection_metrics": selection_metrics,
                 "evaluated_images": evaluated_images,
             }
+            routing_w = model.get_routing_weights()
+            if routing_w is not None:
+                rw_np = routing_w.detach().cpu().numpy()
+                record["routing_weights"] = rw_np.tolist()
             history.append(record)
             if len(optimizer.param_groups) > 1:
                 epoch_lr_str = f"LR_dec={optimizer.param_groups[1]['lr']:.6g} LR_bb={optimizer.param_groups[0]['lr']:.6g}"
@@ -427,12 +441,17 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
                 f"Water={selection_metrics['IoU_water_global']:.2f}% | "
                 f"Others={selection_metrics['IoU_others_global']:.2f}%"
             )
+            if routing_w is not None and model_cfg.readout_mode in ("matrix", "uniform"):
+                rw_str = " | ".join([f"s{s}:[" + " ".join([f"{w:.2f}" for w in rw_np[s]]) + "]" for s in range(rw_np.shape[0])])
+                log_print(f"  ALSR Routing: {rw_str}")
             _save_checkpoint(
                 latest_path, model, optimizer, step, record["epoch"], selection_metrics, config
             )
             score = selection_metrics["mIoU3_report_only_global"]
             if np.isfinite(score) and score > best_value:
                 best_value = score
+                if routing_w is not None:
+                    best_routing_weights = rw_np.tolist()
                 _save_checkpoint(
                     best_path, model, optimizer, step, record["epoch"], selection_metrics, config
                 )
@@ -466,6 +485,12 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         ) if device.type == "cuda" else None,
         "config": config,
     }
+    if model_cfg.adaptive_readout:
+        final_rw = model.get_routing_weights()
+        if final_rw is not None:
+            summary["final_routing_weights"] = final_rw.detach().cpu().numpy().tolist()
+        if best_routing_weights is not None:
+            summary["best_routing_weights"] = best_routing_weights
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     log_print(f"Training completed in {elapsed:.2f}s ({elapsed/60.0:.2f}min). Best {selection_split}_mIoU3={best_value:.4f}% saved at {best_path}")
     return summary
