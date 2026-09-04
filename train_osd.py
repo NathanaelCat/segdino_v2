@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -227,11 +228,11 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         betas=tuple(float(value) for value in optimizer_cfg.get("betas", [0.9, 0.999])),
         weight_decay=float(optimizer_cfg["weight_decay"]),
     )
-    scheduler_cfg = config.get("scheduler")
-    if not isinstance(scheduler_cfg, dict) or scheduler_cfg.get("name") != "constant":
+    scheduler_cfg = config.get("scheduler", {"name": "constant"})
+    scheduler_name = scheduler_cfg.get("name", "constant")
+    if scheduler_name not in {"constant", "cosine"}:
         raise ValueError(
-            "Set scheduler.name='constant' explicitly for the upstream SegDINO profile; "
-            "other schedules are not silently inferred"
+            f"Unsupported scheduler.name='{scheduler_name}'. Supported: 'constant', 'cosine'"
         )
     loss_cfg = config.get("loss")
     if not isinstance(loss_cfg, dict) or loss_cfg.get("name") != "CrossEntropyLoss":
@@ -248,26 +249,33 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
 
     total_params, backbone_params, decoder_params = summarize_parameters(model, backbone)
     trainable_count = sum(parameter.numel() for parameter in trainable_params)
-    print(
-        f"model={config.get('name', 'unnamed')} input={input_size[0]}x{input_size[1]} "
-        f"device={device} selection_split={selection_split}"
-    )
-    print(
-        f"params total={total_params / 1e6:.3f}M backbone={backbone_params / 1e6:.3f}M "
-        f"decoder={decoder_params / 1e6:.3f}M trainable={trainable_count / 1e6:.3f}M"
-    )
-    print(
-        f"optimizer=AdamW lr={optimizer_cfg['lr']} weight_decay={optimizer_cfg['weight_decay']} "
-        f"scheduler=constant "
-        f"loss=CrossEntropyLoss ignore_index={ignore_index} freeze_backbone={model_config.get('freeze_backbone', True)} "
-        f"amp={amp_enabled} deterministic={deterministic} cudnn_benchmark={cudnn_benchmark}"
-    )
 
     run_dir = _resolve_path(config.get("run_dir", "./runs/osd"))
     if smoke:
         run_dir = run_dir / "smoke"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+    log_file = run_dir / "train.log"
+    def log_print(msg: str = "") -> None:
+        print(msg, flush=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    log_print(
+        f"model={config.get('name', 'unnamed')} input={input_size[0]}x{input_size[1]} "
+        f"device={device} selection_split={selection_split}"
+    )
+    log_print(
+        f"params total={total_params / 1e6:.3f}M backbone={backbone_params / 1e6:.3f}M "
+        f"decoder={decoder_params / 1e6:.3f}M trainable={trainable_count / 1e6:.3f}M"
+    )
+    log_print(
+        f"optimizer=AdamW lr={optimizer_cfg['lr']} weight_decay={optimizer_cfg['weight_decay']} "
+        f"scheduler={scheduler_name} "
+        f"loss=CrossEntropyLoss ignore_index={ignore_index} freeze_backbone={model_config.get('freeze_backbone', True)} "
+        f"amp={amp_enabled} deterministic={deterministic} cudnn_benchmark={cudnn_benchmark}"
+    )
 
     epochs = training.get("epochs")
     max_iters = training.get("max_iters")
@@ -278,6 +286,25 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
     max_iters = int(max_iters)
     if smoke:
         max_iters = 1
+
+    if scheduler_name == "cosine":
+        warmup_epochs = float(scheduler_cfg.get("warmup_epochs", 0))
+        warmup_steps = int(warmup_epochs * len(train_loader))
+        min_lr = float(scheduler_cfg.get("min_lr", 1e-6))
+        base_lr = float(optimizer_cfg["lr"])
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return float(current_step + 1) / float(max(1, warmup_steps))
+            progress = float(current_step - warmup_steps) / float(max(1, max_iters - warmup_steps))
+            progress = min(1.0, max(0.0, progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            min_ratio = min_lr / base_lr
+            return min_ratio + (1.0 - min_ratio) * cosine
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        log_print(f"scheduler=cosine warmup_steps={warmup_steps} ({warmup_epochs} epochs) min_lr={min_lr}")
+    else:
+        lr_scheduler = None
+
     val_interval = training.get("val_interval_steps")
     if val_interval is None:
         val_interval = len(train_loader)
@@ -293,6 +320,9 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
     log_interval = max(1, int(training.get("log_interval_steps", 50)))
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
+
+    running_loss_sum = 0.0
+    running_loss_count = 0
 
     for step in range(1, max_iters + 1):
         try:
@@ -316,6 +346,12 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         else:
             loss.backward()
             optimizer.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
+
+        loss_val = float(loss.detach().cpu())
+        running_loss_sum += loss_val
+        running_loss_count += 1
 
         if step == 1 or step % log_interval == 0:
             now = time.perf_counter()
@@ -324,8 +360,8 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
             steps_since_log = 1 if step == 1 else log_interval
             step_seconds = interval_seconds / steps_since_log
             eta_seconds = max(0.0, (max_iters - step) * (elapsed / step))
-            print(
-                f"step={step}/{max_iters} loss={float(loss.detach().cpu()):.5f} "
+            log_print(
+                f"step={step}/{max_iters} loss={loss_val:.5f} "
                 f"lr={optimizer.param_groups[0]['lr']:.8g} "
                 f"step_sec={step_seconds:.3f} eta_min={eta_seconds / 60.0:.1f}"
             )
@@ -336,18 +372,29 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
             selection_metrics, confusion, evaluated_images = evaluate(
                 model, selection_loader, device, num_classes, ignore_index, max_eval_batches
             )
+            epoch_mean_loss = running_loss_sum / max(1, running_loss_count)
+            running_loss_sum = 0.0
+            running_loss_count = 0
+            cur_lr = float(optimizer.param_groups[0]["lr"])
+            epoch_idx = int((step - 1) // len(train_loader) + 1)
             record = {
                 "step": step,
-                "epoch": int((step - 1) // len(train_loader) + 1),
-                "train_loss": float(loss.detach().cpu()),
+                "epoch": epoch_idx,
+                "train_loss": epoch_mean_loss,
+                "last_step_loss": loss_val,
+                "lr": cur_lr,
                 "selection_split": selection_split,
                 "selection_metrics": selection_metrics,
                 "evaluated_images": evaluated_images,
             }
             history.append(record)
-            print(
-                f"step={step}/{max_iters} loss={record['train_loss']:.5f} "
-                f"{selection_split}_mIoU3={selection_metrics['mIoU3_report_only_global']:.4f}%"
+            log_print(
+                f"[Epoch {epoch_idx:02d} | Step {step:04d}/{max_iters}] LR={cur_lr:.6g} | "
+                f"Mean Train Loss={epoch_mean_loss:.5f} | "
+                f"{selection_split}_mIoU3={selection_metrics['mIoU3_report_only_global']:.4f}% | "
+                f"Oil={selection_metrics['IoU_oil_global']:.2f}% | "
+                f"Water={selection_metrics['IoU_water_global']:.2f}% | "
+                f"Others={selection_metrics['IoU_others_global']:.2f}%"
             )
             _save_checkpoint(
                 latest_path, model, optimizer, step, record["epoch"], selection_metrics, config
@@ -389,6 +436,7 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         "config": config,
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    log_print(f"Training completed in {elapsed:.2f}s ({elapsed/60.0:.2f}min). Best {selection_split}_mIoU3={best_value:.4f}% saved at {best_path}")
     return summary
 
 
