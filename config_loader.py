@@ -31,6 +31,9 @@ class ModelConfig:
     readout_mode: str = "matrix"
     readout_init: str = "uniform"
     readout_temperature: float = 1.0
+    wcf_enabled: bool = False
+    wcf_reduction: int = 4
+    wcf_alpha_init: float = 1e-2
 
 
 @dataclass(frozen=True)
@@ -115,6 +118,9 @@ def _build_model_config(overrides):
         readout_mode=overrides.get("readout_mode", BASE_MODEL.readout_mode),
         readout_init=overrides.get("readout_init", BASE_MODEL.readout_init),
         readout_temperature=overrides.get("readout_temperature", BASE_MODEL.readout_temperature),
+        wcf_enabled=overrides.get("wcf_enabled", BASE_MODEL.wcf_enabled),
+        wcf_reduction=overrides.get("wcf_reduction", BASE_MODEL.wcf_reduction),
+        wcf_alpha_init=overrides.get("wcf_alpha_init", BASE_MODEL.wcf_alpha_init),
     )
 
 

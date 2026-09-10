@@ -48,6 +48,9 @@ def main() -> None:
         readout_mode=str(model_config.get("readout_mode", "matrix")),
         readout_init=str(model_config.get("readout_init", "uniform")),
         readout_temperature=float(model_config.get("readout_temperature", 1.0)),
+        wcf_enabled=bool(model_config.get("wcf_enabled", False)),
+        wcf_reduction=int(model_config.get("wcf_reduction", 4)),
+        wcf_alpha_init=float(model_config.get("wcf_alpha_init", 1e-2)),
     )
     model, _ = build_model(model_cfg, str(device))
     if bool(model_config.get("freeze_backbone", True)):

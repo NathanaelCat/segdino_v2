@@ -65,6 +65,9 @@ def build_model(model_config: ModelConfig, device: str) -> Tuple[torch.nn.Module
         readout_mode=getattr(model_config, "readout_mode", "matrix"),
         readout_init=getattr(model_config, "readout_init", "uniform"),
         readout_temperature=getattr(model_config, "readout_temperature", 1.0),
+        wcf_enabled=getattr(model_config, "wcf_enabled", False),
+        wcf_reduction=getattr(model_config, "wcf_reduction", 4),
+        wcf_alpha_init=getattr(model_config, "wcf_alpha_init", 1e-2),
     ).to(device)
     return model, backbone
 

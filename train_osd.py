@@ -190,6 +190,9 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         readout_mode=str(model_config.get("readout_mode", "matrix")),
         readout_init=str(model_config.get("readout_init", "uniform")),
         readout_temperature=float(model_config.get("readout_temperature", 1.0)),
+        wcf_enabled=bool(model_config.get("wcf_enabled", False)),
+        wcf_reduction=int(model_config.get("wcf_reduction", 4)),
+        wcf_alpha_init=float(model_config.get("wcf_alpha_init", 1e-2)),
     )
 
     worker_count = 0 if smoke else int(training.get("workers", 4))
@@ -292,6 +295,12 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         f"params total={total_params / 1e6:.3f}M backbone={backbone_params / 1e6:.3f}M "
         f"decoder={decoder_params / 1e6:.3f}M trainable={trainable_count / 1e6:.3f}M"
     )
+    if model_cfg.wcf_enabled:
+        wcf_params = sum(parameter.numel() for block in model.get_wcf_blocks() for parameter in block.parameters())
+        log_print(
+            f"wcf=enabled blocks=3 reduction={model_cfg.wcf_reduction} "
+            f"alpha_init={model_cfg.wcf_alpha_init} added_params={wcf_params}"
+        )
     if not freeze_backbone and backbone_lr is not None:
         opt_info = f"optimizer=AdamW lr_decoder={base_lr} lr_backbone={float(backbone_lr)} weight_decay={optimizer_cfg['weight_decay']}"
     else:
@@ -303,6 +312,8 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
     )
     if model_config.get("layer_mapping") is not None:
         log_print(f"layer_mapping={model_config['layer_mapping']} (reversed/permuted routing)")
+    elif model_cfg.wcf_enabled:
+        log_print("layer_mapping=null (native [L3,L6,L9,L12] sources for L12-anchored WCF)")
     if model_cfg.adaptive_readout:
         log_print(
             f"adaptive_readout=True mode={model_cfg.readout_mode} "

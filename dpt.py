@@ -3,6 +3,73 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class L12AnchoredWCF(nn.Module):
+    """L12-anchored token/channel selective shallow supplementation.
+
+    The module deliberately stays in token space.  ``fi`` is one auxiliary
+    DINO patch-token sequence and ``fl`` is the final-layer patch-token
+    sequence.  The two MLPs produce a per-token, per-channel gate; the
+    projected auxiliary feature is then injected as a small residual into the
+    final-layer anchor.
+    """
+
+    def __init__(self, channels: int, reduction: int = 4, alpha_init: float = 1e-2):
+        super().__init__()
+        if channels <= 0 or reduction <= 0:
+            raise ValueError("channels and reduction must be positive")
+        hidden = channels // reduction
+        if hidden <= 0:
+            raise ValueError(f"reduction={reduction} is too large for channels={channels}")
+
+        self.channels = int(channels)
+        self.reduction = int(reduction)
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(4 * channels, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, channels),
+        )
+        self.token_mlp = nn.Sequential(
+            nn.Linear(2 * channels, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, channels),
+        )
+        self.projection = nn.Linear(channels, channels)
+        nn.init.zeros_(self.channel_mlp[-1].weight)
+        nn.init.zeros_(self.channel_mlp[-1].bias)
+        nn.init.zeros_(self.token_mlp[-1].weight)
+        nn.init.zeros_(self.token_mlp[-1].bias)
+        nn.init.eye_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    def forward(self, fi: torch.Tensor, fl: torch.Tensor, return_gate: bool = False):
+        if fi.ndim != 3 or fl.ndim != 3:
+            raise ValueError(
+                f"WCF expects token tensors [B,N,C], got {tuple(fi.shape)} and {tuple(fl.shape)}"
+            )
+        if fi.shape != fl.shape:
+            raise ValueError(
+                f"WCF auxiliary/anchor shapes must match, got {tuple(fi.shape)} and {tuple(fl.shape)}"
+            )
+        if fi.shape[-1] != self.channels:
+            raise ValueError(
+                f"WCF expected channel dimension {self.channels}, got {fi.shape[-1]}"
+            )
+
+        avg_i = fi.mean(dim=1)
+        max_i = fi.max(dim=1).values
+        avg_l = fl.mean(dim=1)
+        max_l = fl.max(dim=1).values
+        lc = self.channel_mlp(torch.cat((avg_i, max_i, avg_l, max_l), dim=-1)).unsqueeze(1)
+        lt = self.token_mlp(torch.cat((fi, fl), dim=-1))
+        gate = torch.sigmoid(lt + lc)
+        delta = gate * self.projection(fi)
+        result = fl + self.alpha * delta
+        if return_gate:
+            return result, gate
+        return result
+
+
 class ResidualDepthwiseBlock(nn.Module):
     def __init__(self, channels, use_group_norm=True):
         super().__init__()
@@ -227,6 +294,9 @@ class DPT(nn.Module):
         readout_mode="matrix",
         readout_init="uniform",
         readout_temperature=1.0,
+        wcf_enabled=False,
+        wcf_reduction=4,
+        wcf_alpha_init=1e-2,
     ):
         super(DPT, self).__init__()
 
@@ -240,9 +310,27 @@ class DPT(nn.Module):
         self.patch_size = patch_size
         self.backbone = backbone
         self.layer_mapping = list(layer_mapping) if layer_mapping is not None else None
+        self.wcf_enabled = bool(wcf_enabled)
+        if self.wcf_enabled and self.layer_mapping not in (None, [0, 1, 2, 3]):
+            raise ValueError(
+                "WCF requires the four native intermediate features [L3,L6,L9,L12]; "
+                "use layer_mapping=null or [0,1,2,3]"
+            )
         self._backbone_locked = False
         self.nclass = nclass
         self.in_dims = [self.backbone.embed_dim] * 4
+        self.wcf_blocks = nn.ModuleList(
+            [
+                L12AnchoredWCF(
+                    self.backbone.embed_dim,
+                    reduction=wcf_reduction,
+                    alpha_init=wcf_alpha_init,
+                )
+                for _ in range(3)
+            ]
+            if self.wcf_enabled
+            else []
+        )
         self.decoder = TPASADDecoder(
             self.in_dims,
             decoder_channels=decoder_channels,
@@ -258,6 +346,9 @@ class DPT(nn.Module):
         if hasattr(self.decoder, "alsr") and self.decoder.alsr is not None:
             return self.decoder.alsr.get_routing_weights()
         return None
+
+    def get_wcf_blocks(self):
+        return self.wcf_blocks
 
     def lock_backbone(self):
         for p in self.backbone.parameters():
@@ -279,7 +370,7 @@ class DPT(nn.Module):
             self.backbone.eval()
         return self
 
-    def forward(self, x, return_feats=False):
+    def forward(self, x, return_feats=False, return_wcf_gates=False):
         patch_h, patch_w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         if self._backbone_locked:
             with torch.no_grad():
@@ -291,11 +382,22 @@ class DPT(nn.Module):
                 x, n=self.intermediate_layer_idx[self.encoder_size]
             )
 
-        if self.layer_mapping is not None:
+        wcf_gates = []
+        if self.wcf_enabled:
+            anchor = feats[-1]
+            supplemented = []
+            for block, auxiliary in zip(self.wcf_blocks, feats[:3]):
+                result, gate = block(auxiliary, anchor, return_gate=True)
+                supplemented.append(result)
+                wcf_gates.append(gate)
+            feats = supplemented + [anchor]
+        elif self.layer_mapping is not None:
             feats = [feats[i] for i in self.layer_mapping]
 
         out = self.decoder(feats, patch_h, patch_w)
         out = F.interpolate(out, size=x.shape[-2:], mode='bilinear', align_corners=False)
+        if return_wcf_gates:
+            return out, feats[-1], tuple(wcf_gates)
         if return_feats:
             return out, feats[-1]
         return out

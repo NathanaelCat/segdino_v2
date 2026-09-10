@@ -1,0 +1,74 @@
+{
+  "name": "DINO-LAYER-WCF-001_L12-anchored-WCF-v1",
+  "experiment_id": "DINO-LAYER-WCF-001",
+  "protocol_id": "OSD-EXP-v1.0/L4-global-512",
+  "data_root": "../archive",
+  "train_split": "train",
+  "val_split": "val",
+  "test_split": "test",
+  "selection_split": "val",
+  "input_size": 512,
+  "num_classes": 4,
+  "ignore_index": 255,
+  "model": {
+    "dino_size": "s",
+    "dino_repo": "../../Project2/dinov3",
+    "dino_ckpt": "../../Project2/weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+    "decoder_dim": 256,
+    "use_bn": false,
+    "patch_size": 16,
+    "freeze_backbone": true,
+    "variant": "current_release",
+    "layer_mapping": null,
+    "wcf_enabled": true,
+    "wcf_reduction": 4,
+    "wcf_alpha_init": 0.01
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "lr": 0.0001,
+    "betas": [0.9, 0.999],
+    "weight_decay": 0.0001
+  },
+  "scheduler": {
+    "name": "cosine",
+    "warmup_epochs": 3,
+    "min_lr": 2e-05
+  },
+  "loss": {
+    "name": "CrossEntropyLoss"
+  },
+  "training": {
+    "batch_size": 8,
+    "eval_batch_size": 1,
+    "workers": 4,
+    "epochs": 50,
+    "max_iters": null,
+    "val_interval_steps": null,
+    "max_eval_batches": null,
+    "log_interval_steps": 50
+  },
+  "augmentation": {
+    "horizontal_flip": true,
+    "vertical_flip": true,
+    "rotate_degrees": 15,
+    "color_jitter": {
+      "brightness": 0.2,
+      "contrast": 0.2,
+      "saturation": 0.1,
+      "hue": 0.05
+    }
+  },
+  "preprocessing": {
+    "resize_mode": "stretch"
+  },
+  "runtime": {
+    "seed": 20260901,
+    "deterministic": false,
+    "cudnn_benchmark": false,
+    "allow_large_cudnn_workspace": false,
+    "amp": false,
+    "device": "cuda:0"
+  },
+  "run_dir": "./runs/dino_layer_wcf_001_frozen512_50e_cf2e5_seed20260901"
+}
