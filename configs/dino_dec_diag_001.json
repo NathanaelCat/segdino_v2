@@ -1,0 +1,30 @@
+{
+  "name": "DINO-DEC-DIAG-001_decoder_tomography",
+  "experiment_id": "DINO-DEC-DIAG-001",
+  "base_experiment_id": "DINO-LAYER-CTRL-003",
+  "base_config": "configs/dino_layer_ctrl_003_l12x4_seed20260901.json",
+  "base_checkpoint": "runs/dino_layer_ctrl_003_l12x4_seed20260901/best.pth",
+  "protocol_id": "OSD-EXP-v1.0/L4-global-512",
+  "split": "val",
+  "expected_images": 203,
+  "test_accessed": false,
+  "training_started": false,
+  "phase1": {
+    "gamma_inventory": "enumerate every actual ResidualDepthwiseBlock",
+    "tpa_leave_one_out": ["x8", "x4", "x2", "x1"],
+    "sad_residual_bypass": "each actual ResidualDepthwiseBlock individually, temporary out=x"
+  },
+  "phase2": {
+    "status": "prepared_only",
+    "sources": ["raw decoder input", "TPA outputs", "SAD intra outputs"]
+  },
+  "phase3": {
+    "status": "prepared_only",
+    "sources": "pre-add Upsample(T_{i+1}) and lateral F_i",
+    "statistics": ["cosine distribution", "negative cosine ratio", "low-similarity ratio", "optional error correlation"]
+  },
+  "runtime": {
+    "workers": 0,
+    "device": "cuda:0"
+  }
+}
