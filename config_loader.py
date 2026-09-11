@@ -23,6 +23,9 @@ class ModelConfig:
     use_bn: bool = False
     num_classes: int = 1
     patch_size: int = 16
+    decoder_variant: str = "tpa_sad"
+    spatial_stride: int = 4
+    freeze_backbone: bool = True
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,9 @@ BASE_MODEL = ModelConfig(
     use_bn=RAW_CONFIG["base_model"].get("use_bn", False),
     num_classes=RAW_CONFIG["base_model"].get("num_classes", 1),
     patch_size=RAW_CONFIG["base_model"].get("patch_size", 16),
+    decoder_variant=RAW_CONFIG["base_model"].get("decoder_variant", "tpa_sad"),
+    spatial_stride=RAW_CONFIG["base_model"].get("spatial_stride", 4),
+    freeze_backbone=RAW_CONFIG["base_model"].get("freeze_backbone", True),
 )
 
 
@@ -102,6 +108,9 @@ def _build_model_config(overrides):
         use_bn=overrides.get("use_bn", BASE_MODEL.use_bn),
         num_classes=overrides.get("num_classes", BASE_MODEL.num_classes),
         patch_size=overrides.get("patch_size", BASE_MODEL.patch_size),
+        decoder_variant=overrides.get("decoder_variant", BASE_MODEL.decoder_variant),
+        spatial_stride=overrides.get("spatial_stride", BASE_MODEL.spatial_stride),
+        freeze_backbone=overrides.get("freeze_backbone", BASE_MODEL.freeze_backbone),
     )
 
 
