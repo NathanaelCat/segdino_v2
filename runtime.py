@@ -29,6 +29,9 @@ def build_model(model_config: ModelConfig, device: str) -> Tuple[torch.nn.Module
         use_bn=model_config.use_bn,
         patch_size=model_config.patch_size,
         backbone=backbone,
+        decoder_variant=model_config.decoder_variant,
+        spatial_stride=model_config.spatial_stride,
+        freeze_backbone=model_config.freeze_backbone,
     ).to(device)
     return model, backbone
 
