@@ -26,7 +26,10 @@
     "decoder_dim": 256,
     "use_bn": false,
     "num_classes": 1,
-    "patch_size": 16
+    "patch_size": 16,
+    "decoder_variant": "semantic_spatial",
+    "spatial_stride": 4,
+    "freeze_backbone": true
   },
   "train_experiments": {
     "kvasir_train": {
