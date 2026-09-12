@@ -80,6 +80,61 @@ def _summarize_dpa_trace(model: nn.Module, trace: dict[str, Any]) -> dict[str, A
     return {"alpha": alpha, "scores": score_stats}
 
 
+def _summarize_patch_dpa_trace(model: nn.Module, trace: dict[str, Any]) -> dict[str, Any]:
+    """Summarize the four-depth patch-guided DPA path without saving maps."""
+    decoder = getattr(model, "decoder", None)
+    if decoder is None:
+        raise RuntimeError("Patch-DPA diagnostics require a model decoder")
+    depth_names = ("3", "6", "9", "12")
+    scores = trace.get("scores")
+    cosines = trace.get("cosines")
+    projected = trace.get("projected")
+    residuals = trace.get("residuals")
+    expected_length = len(depth_names)
+    if any(
+        values is None or len(values) != expected_length
+        for values in (scores, cosines, projected, residuals)
+    ):
+        raise RuntimeError(
+            "Patch-DPA diagnostics must return four scores, cosines, projected maps, "
+            "and residual maps"
+        )
+
+    def spatial_stats(value: torch.Tensor) -> dict[str, float]:
+        value = value.detach().float()
+        return {
+            "mean": float(value.mean().item()),
+            "std": float(value.std(unbiased=False).item()),
+            "min": float(value.min().item()),
+            "max": float(value.max().item()),
+        }
+
+    alpha = {
+        f"alpha_{name}": float(getattr(decoder, f"alpha_{name}").detach().float().item())
+        for name in depth_names
+    }
+    score_stats = {
+        f"S{name}": spatial_stats(value)
+        for name, value in zip(depth_names, scores)
+    }
+    cosine_stats = {
+        f"cos_{name}": spatial_stats(value)
+        for name, value in zip(depth_names, cosines)
+    }
+    residual_ratios = {}
+    for name, feature, residual in zip(depth_names, projected, residuals):
+        feature_flat = feature.detach().float().flatten(1)
+        residual_flat = residual.detach().float().flatten(1)
+        ratio = residual_flat.norm(dim=1) / feature_flat.norm(dim=1).clamp_min(1e-12)
+        residual_ratios[f"R{name}"] = spatial_stats(ratio)
+    return {
+        "alpha": alpha,
+        "scores": score_stats,
+        "cosines": cosine_stats,
+        "residual_ratios": residual_ratios,
+    }
+
+
 def _seed_everything(seed: int, deterministic: bool, cudnn_benchmark: bool) -> None:
     if deterministic and cudnn_benchmark:
         raise ValueError("deterministic=True and cudnn_benchmark=True are contradictory")
@@ -156,7 +211,10 @@ def evaluate(
             if diagnostics_fn is None:
                 raise RuntimeError("DPA statistics requested but model has no diagnostics API")
             logits, trace = diagnostics_fn(inputs_device)
-            dpa_stats = _summarize_dpa_trace(model, trace)
+            if model.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}:
+                dpa_stats = _summarize_patch_dpa_trace(model, trace)
+            else:
+                dpa_stats = _summarize_dpa_trace(model, trace)
         else:
             logits = model(inputs_device)
         confusion += confusion_from_logits(logits, targets, num_classes, ignore_index)
@@ -215,6 +273,38 @@ def _load_init_checkpoint(model: nn.Module, path: Path) -> dict[str, Any]:
         if set(missing) != expected_missing or unexpected:
             raise RuntimeError(
                 "DPA initialization checkpoint alignment mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+    elif variant in {"patch_dpa_shared", "patch_dpa_independent"}:
+        expected_missing = {
+            "decoder.depth_alignments.0.weight",
+            "decoder.depth_alignments.1.weight",
+            "decoder.depth_alignments.2.weight",
+            "decoder.depth_alignments.3.weight",
+            "decoder.alpha_3",
+            "decoder.alpha_6",
+            "decoder.alpha_9",
+            "decoder.alpha_12",
+        }
+        adapter_weight_names = (
+            ("in_projection", "depthwise", "out_projection")
+            if variant == "patch_dpa_shared"
+            else None
+        )
+        if adapter_weight_names is not None:
+            expected_missing.update(
+                f"decoder.patch_adapter.{name}.weight" for name in adapter_weight_names
+            )
+        else:
+            expected_missing.update(
+                f"decoder.patch_adapters.{index}.{name}.weight"
+                for index in range(4)
+                for name in ("in_projection", "depthwise", "out_projection")
+            )
+        missing_set = set(missing)
+        if missing_set not in (expected_missing, set()) or unexpected:
+            raise RuntimeError(
+                "Patch-DPA initialization checkpoint alignment mismatch: "
                 f"missing={missing}, unexpected={unexpected}"
             )
     elif missing or unexpected:
@@ -544,7 +634,12 @@ def run(
 
         should_validate = step == max_iters or step % val_interval == 0
         if should_validate:
-            collect_dpa_stats = model_cfg.decoder_variant in {"dpa_ms_mlp", "dpa_sad_base"}
+            collect_dpa_stats = model_cfg.decoder_variant in {
+                "dpa_ms_mlp",
+                "dpa_sad_base",
+                "patch_dpa_shared",
+                "patch_dpa_independent",
+            }
             evaluation = evaluate(
                 model,
                 selection_loader,
@@ -603,6 +698,17 @@ def run(
                 )
                 log_print(f"  DPA alpha: {alpha_str}")
                 log_print(f"  DPA scores: {score_str}")
+                if "cosines" in dpa_stats:
+                    cosine_str = " | ".join(
+                        f"{name}:mean={stats['mean']:.4f},std={stats['std']:.4f}"
+                        for name, stats in dpa_stats["cosines"].items()
+                    )
+                    residual_str = " | ".join(
+                        f"{name}={stats['mean']:.6f}"
+                        for name, stats in dpa_stats["residual_ratios"].items()
+                    )
+                    log_print(f"  DPA cosine: {cosine_str}")
+                    log_print(f"  DPA residual_ratio: {residual_str}")
             if routing_w is not None and model_cfg.readout_mode in ("matrix", "uniform"):
                 rw_str = " | ".join([f"s{s}:[" + " ".join([f"{w:.2f}" for w in rw_np[s]]) + "]" for s in range(rw_np.shape[0])])
                 log_print(f"  ALSR Routing: {rw_str}")
@@ -649,7 +755,12 @@ def run(
         ) if device.type == "cuda" else None,
         "config": config,
     }
-    if model_cfg.decoder_variant in {"dpa_ms_mlp", "dpa_sad_base"} and history:
+    if model_cfg.decoder_variant in {
+        "dpa_ms_mlp",
+        "dpa_sad_base",
+        "patch_dpa_shared",
+        "patch_dpa_independent",
+    } and history:
         summary["dpa_diagnostics_last"] = history[-1].get("dpa_stats")
         summary["dpa_diagnostics_best"] = best_dpa_stats
     if model_cfg.adaptive_readout:
