@@ -63,11 +63,13 @@ def l4_global_metrics(confusion: np.ndarray) -> dict[str, float]:
         raise ValueError(f"Expected a {expected[0]}x{expected[1]} confusion matrix, got {confusion.shape}")
 
     iou_all, iou_ignore_background, miou4, miou3_report, miou3_ignore_background = _raw_l4_values(confusion)
+    precision_all, recall_all, f1_all, pixel_accuracy = _raw_classification_values(confusion)
+    report_f1 = [f1_all[name] for name in REPORT_CLASSES]
 
     def pct(value: float) -> float:
         return round(value * 100.0, 6)
 
-    return {
+    metrics = {
         "mIoU3_report_only_global": pct(miou3_report),
         "mIoU4_all_classes_global": pct(miou4),
         "mIoU3_ignore_gt_background_global": pct(miou3_ignore_background),
@@ -75,7 +77,15 @@ def l4_global_metrics(confusion: np.ndarray) -> dict[str, float]:
         "IoU_oil_global": pct(iou_all["oil"]),
         "IoU_water_global": pct(iou_all["water"]),
         "IoU_others_global": pct(iou_all["others"]),
+        "mF1_3_report_only_global": pct(float(np.nanmean(report_f1))),
+        "mF1_4_all_classes_global": pct(float(np.nanmean(list(f1_all.values())))),
+        "PixelAccuracy_global": pct(pixel_accuracy),
     }
+    for name in CURRENT_CLASSES:
+        metrics[f"Precision_{name}_global"] = pct(precision_all[name])
+        metrics[f"Recall_{name}_global"] = pct(recall_all[name])
+        metrics[f"F1_{name}_global"] = pct(f1_all[name])
+    return metrics
 
 
 def _raw_l4_values(
@@ -97,6 +107,34 @@ def _raw_l4_values(
     return iou_all, iou_ignore_background, miou4, miou3_report, miou3_ignore_background
 
 
+def _raw_classification_values(
+    confusion: np.ndarray,
+) -> tuple[dict[str, float], dict[str, float], dict[str, float], float]:
+    """Return global one-vs-rest precision, recall, F1/Dice and pixel accuracy."""
+    gt_counts = confusion.sum(axis=1).astype(np.float64)
+    predicted_counts = confusion.sum(axis=0).astype(np.float64)
+    true_positive = np.diag(confusion).astype(np.float64)
+
+    def safe_ratio(numerator: float, denominator: float) -> float:
+        return numerator / denominator if denominator else float("nan")
+
+    precision = {
+        name: safe_ratio(true_positive[index], predicted_counts[index])
+        for index, name in enumerate(CURRENT_CLASSES)
+    }
+    recall = {
+        name: safe_ratio(true_positive[index], gt_counts[index])
+        for index, name in enumerate(CURRENT_CLASSES)
+    }
+    f1 = {
+        name: safe_ratio(2.0 * true_positive[index], gt_counts[index] + predicted_counts[index])
+        for index, name in enumerate(CURRENT_CLASSES)
+    }
+    total = float(confusion.sum())
+    pixel_accuracy = safe_ratio(float(true_positive.sum()), total)
+    return precision, recall, f1, pixel_accuracy
+
+
 def make_l4_payload(
     confusion: np.ndarray,
     split: str,
@@ -109,6 +147,7 @@ def make_l4_payload(
     confusion = np.asarray(confusion, dtype=np.int64)
     metrics = l4_global_metrics(confusion)
     iou_all, iou_ignore_background, miou4, miou3_report, miou3_ignore_background = _raw_l4_values(confusion)
+    precision_all, recall_all, f1_all, pixel_accuracy = _raw_classification_values(confusion)
     payload = {
         "protocol_id": protocol_id,
         "model": model_name,
@@ -127,6 +166,13 @@ def make_l4_payload(
         "iou_global_current_order": iou_all,
         "iou_report_order": {name: iou_all[name] for name in REPORT_CLASSES},
         "iou_ignore_gt_background": iou_ignore_background,
+        "precision_global_current_order": precision_all,
+        "recall_global_current_order": recall_all,
+        "f1_global_current_order": f1_all,
+        "f1_report_order": {name: f1_all[name] for name in REPORT_CLASSES},
+        "mF1_3_report_only_global": float(np.nanmean([f1_all[name] for name in REPORT_CLASSES])),
+        "mF1_4_all_classes_global": float(np.nanmean(list(f1_all.values()))),
+        "PixelAccuracy_global": pixel_accuracy,
         "mIoU4_all_classes_global": miou4,
         "mIoU3_report_only_global": miou3_report,
         "mIoU3_ignore_gt_background_global": miou3_ignore_background,

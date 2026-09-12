@@ -55,6 +55,31 @@ def _input_size_metadata(size: tuple[int, int]) -> int | list[int]:
     return size[0] if size[0] == size[1] else [size[0], size[1]]
 
 
+def _summarize_dpa_trace(model: nn.Module, trace: dict[str, Any]) -> dict[str, Any]:
+    decoder = getattr(model, "decoder", None)
+    if decoder is None:
+        raise RuntimeError("DPA diagnostics require a model decoder")
+    score_names = ("S3", "S6", "S9")
+    scores = trace.get("scores")
+    if scores is None or len(scores) != len(score_names):
+        raise RuntimeError("DPA diagnostics did not return S3/S6/S9 scores")
+
+    score_stats: dict[str, dict[str, float]] = {}
+    for name, score in zip(score_names, scores):
+        value = score.detach().float()
+        score_stats[name] = {
+            "mean": float(value.mean().item()),
+            "std": float(value.std(unbiased=False).item()),
+            "min": float(value.min().item()),
+            "max": float(value.max().item()),
+        }
+    alpha = {
+        name: float(getattr(decoder, name).detach().float().item())
+        for name in ("alpha_3", "alpha_6", "alpha_9")
+    }
+    return {"alpha": alpha, "scores": score_stats}
+
+
 def _seed_everything(seed: int, deterministic: bool, cudnn_benchmark: bool) -> None:
     if deterministic and cudnn_benchmark:
         raise ValueError("deterministic=True and cudnn_benchmark=True are contradictory")
@@ -116,17 +141,32 @@ def evaluate(
     num_classes: int,
     ignore_index: int,
     max_batches: Optional[int] = None,
-) -> tuple[dict[str, float], np.ndarray, int]:
+    collect_dpa_stats: bool = False,
+) -> tuple[dict[str, float], np.ndarray, int] | tuple[dict[str, float], np.ndarray, int, dict[str, Any]]:
     model.eval()
     confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
     images = 0
+    dpa_stats = None
     for batch_index, (inputs, targets, _) in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
             break
-        logits = model(inputs.to(device, non_blocking=True))
+        inputs_device = inputs.to(device, non_blocking=True)
+        if collect_dpa_stats and batch_index == 0:
+            diagnostics_fn = getattr(model, "dpa_diagnostics", None)
+            if diagnostics_fn is None:
+                raise RuntimeError("DPA statistics requested but model has no diagnostics API")
+            logits, trace = diagnostics_fn(inputs_device)
+            dpa_stats = _summarize_dpa_trace(model, trace)
+        else:
+            logits = model(inputs_device)
         confusion += confusion_from_logits(logits, targets, num_classes, ignore_index)
         images += inputs.shape[0]
-    return l4_global_metrics(confusion), confusion, images
+    metrics = l4_global_metrics(confusion)
+    if collect_dpa_stats:
+        if dpa_stats is None:
+            raise RuntimeError("DPA statistics requested but evaluation produced no batches")
+        return metrics, confusion, images, dpa_stats
+    return metrics, confusion, images
 
 
 def _save_checkpoint(
@@ -152,7 +192,49 @@ def _save_checkpoint(
     )
 
 
-def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> dict[str, Any]:
+def _load_init_checkpoint(model: nn.Module, path: Path) -> dict[str, Any]:
+    path = path.resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Initialization checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location="cpu")
+    state = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state, dict):
+        raise TypeError(f"Unsupported initialization checkpoint payload: {type(state)!r}")
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    variant = str(getattr(model, "decoder_variant", ""))
+    if variant in {"dpa_ms_mlp", "dpa_sad_base"}:
+        expected_missing = {
+            "decoder.phi_3.weight",
+            "decoder.phi_6.weight",
+            "decoder.phi_9.weight",
+            "decoder.alpha_3",
+            "decoder.alpha_6",
+            "decoder.alpha_9",
+        }
+        if set(missing) != expected_missing or unexpected:
+            raise RuntimeError(
+                "DPA initialization checkpoint alignment mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+    elif missing or unexpected:
+        raise RuntimeError(
+            f"Initialization checkpoint mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    return {
+        "path": str(path),
+        "missing_keys": sorted(missing),
+        "unexpected_keys": sorted(unexpected),
+        "model_variant": variant,
+    }
+
+
+def run(
+    config: dict[str, Any],
+    device: torch.device,
+    smoke: bool = False,
+    init_checkpoint: str | Path | None = None,
+) -> dict[str, Any]:
     runtime = config.get("runtime", {})
     seed = int(runtime.get("seed", 20260901))
     deterministic = bool(runtime.get("deterministic", False))
@@ -185,6 +267,9 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         use_bn=bool(model_config.get("use_bn", False)),
         num_classes=num_classes,
         patch_size=patch_size,
+        decoder_variant=str(model_config.get("decoder_variant", "tpa_sad")),
+        spatial_stride=int(model_config.get("spatial_stride", 4)),
+        freeze_backbone=bool(model_config.get("freeze_backbone", True)),
         layer_mapping=model_config.get("layer_mapping"),
         adaptive_readout=bool(model_config.get("adaptive_readout", False)),
         readout_mode=str(model_config.get("readout_mode", "matrix")),
@@ -224,6 +309,9 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
     freeze_backbone = bool(model_config.get("freeze_backbone", True))
     if freeze_backbone:
         model.lock_backbone()
+    init_checkpoint_info = None
+    if init_checkpoint is not None:
+        init_checkpoint_info = _load_init_checkpoint(model, _resolve_path(init_checkpoint))
     trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters remain after applying freeze_backbone")
@@ -291,6 +379,12 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         f"model={config.get('name', 'unnamed')} input={input_size[0]}x{input_size[1]} "
         f"device={device} selection_split={selection_split}"
     )
+    if init_checkpoint_info is not None:
+        log_print(
+            f"init_checkpoint={init_checkpoint_info['path']} "
+            f"missing_keys={init_checkpoint_info['missing_keys']} "
+            f"unexpected_keys={init_checkpoint_info['unexpected_keys']}"
+        )
     log_print(
         f"params total={total_params / 1e6:.3f}M backbone={backbone_params / 1e6:.3f}M "
         f"decoder={decoder_params / 1e6:.3f}M trainable={trainable_count / 1e6:.3f}M"
@@ -318,6 +412,38 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         log_print(
             f"adaptive_readout=True mode={model_cfg.readout_mode} "
             f"init={model_cfg.readout_init} tau={model_cfg.readout_temperature}"
+        )
+    if model_cfg.decoder_variant == "semantic_spatial":
+        log_print(
+            f"decoder_variant={model_cfg.decoder_variant} "
+            f"spatial_stride={model_cfg.spatial_stride}"
+        )
+    elif model_cfg.decoder_variant == "mlp_same_scale":
+        log_print(
+            "decoder_variant=mlp_same_scale; four native [L3,L6,L9,L12] "
+            "features remain at one 32x32 grid; no spatial decoder transform"
+        )
+    elif model_cfg.decoder_variant == "tpa_ms_mlp":
+        log_print(
+            "decoder_variant=tpa_ms_mlp; original TPA produces "
+            "256/128/64/32 branches; neutral MS-MLP aligns to 256x256; no SAD"
+        )
+    elif model_cfg.decoder_variant == "dpa_ms_mlp":
+        log_print(
+            "decoder_variant=dpa_ms_mlp; DPA after token_projection and before "
+            "TPA reconstruction; TPA produces 256/128/64/32 branches; no SAD"
+        )
+    elif model_cfg.decoder_variant == "tpa_sad_base":
+        log_print(
+            "decoder_variant=tpa_sad_base; current TPA PR produces "
+            "256/128/64/32 branches; neutral SAD-Base is progressive "
+            "upsample+add only; no SAD refinement blocks"
+        )
+    elif model_cfg.decoder_variant == "dpa_sad_base":
+        log_print(
+            "decoder_variant=dpa_sad_base; DPA after token_projection and "
+            "before TPA reconstruction; SAD-Base is progressive upsample+add "
+            "only; no SAD refinement blocks"
         )
 
     epochs = training.get("epochs")
@@ -356,6 +482,7 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
     history: list[dict[str, Any]] = []
     best_value = float("-inf")
     best_routing_weights = None
+    best_dpa_stats = None
     best_path = run_dir / "best.pth"
     latest_path = run_dir / "latest.pth"
     loader_iter = iter(train_loader)
@@ -417,9 +544,21 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
 
         should_validate = step == max_iters or step % val_interval == 0
         if should_validate:
-            selection_metrics, confusion, evaluated_images = evaluate(
-                model, selection_loader, device, num_classes, ignore_index, max_eval_batches
+            collect_dpa_stats = model_cfg.decoder_variant in {"dpa_ms_mlp", "dpa_sad_base"}
+            evaluation = evaluate(
+                model,
+                selection_loader,
+                device,
+                num_classes,
+                ignore_index,
+                max_eval_batches,
+                collect_dpa_stats=collect_dpa_stats,
             )
+            if collect_dpa_stats:
+                selection_metrics, confusion, evaluated_images, dpa_stats = evaluation
+            else:
+                selection_metrics, confusion, evaluated_images = evaluation
+                dpa_stats = None
             epoch_mean_loss = running_loss_sum / max(1, running_loss_count)
             running_loss_sum = 0.0
             running_loss_count = 0
@@ -435,6 +574,8 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
                 "selection_metrics": selection_metrics,
                 "evaluated_images": evaluated_images,
             }
+            if dpa_stats is not None:
+                record["dpa_stats"] = dpa_stats
             routing_w = model.get_routing_weights()
             if routing_w is not None:
                 rw_np = routing_w.detach().cpu().numpy()
@@ -452,6 +593,16 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
                 f"Water={selection_metrics['IoU_water_global']:.2f}% | "
                 f"Others={selection_metrics['IoU_others_global']:.2f}%"
             )
+            if dpa_stats is not None:
+                alpha_str = " ".join(
+                    f"{name}={value:.6f}" for name, value in dpa_stats["alpha"].items()
+                )
+                score_str = " | ".join(
+                    f"{name}:mean={stats['mean']:.4f},std={stats['std']:.4f}"
+                    for name, stats in dpa_stats["scores"].items()
+                )
+                log_print(f"  DPA alpha: {alpha_str}")
+                log_print(f"  DPA scores: {score_str}")
             if routing_w is not None and model_cfg.readout_mode in ("matrix", "uniform"):
                 rw_str = " | ".join([f"s{s}:[" + " ".join([f"{w:.2f}" for w in rw_np[s]]) + "]" for s in range(rw_np.shape[0])])
                 log_print(f"  ALSR Routing: {rw_str}")
@@ -461,6 +612,7 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
             score = selection_metrics["mIoU3_report_only_global"]
             if np.isfinite(score) and score > best_value:
                 best_value = score
+                best_dpa_stats = dpa_stats
                 if routing_w is not None:
                     best_routing_weights = rw_np.tolist()
                 _save_checkpoint(
@@ -491,11 +643,15 @@ def run(config: dict[str, Any], device: torch.device, smoke: bool = False) -> di
         "params_backbone": backbone_params,
         "params_decoder": decoder_params,
         "params_trainable": trainable_count,
+        "init_checkpoint": init_checkpoint_info,
         "peak_memory_mib": round(
             torch.cuda.max_memory_allocated(device) / 1024**2, 2
         ) if device.type == "cuda" else None,
         "config": config,
     }
+    if model_cfg.decoder_variant in {"dpa_ms_mlp", "dpa_sad_base"} and history:
+        summary["dpa_diagnostics_last"] = history[-1].get("dpa_stats")
+        summary["dpa_diagnostics_best"] = best_dpa_stats
     if model_cfg.adaptive_readout:
         final_rw = model.get_routing_weights()
         if final_rw is not None:
@@ -516,6 +672,11 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=None, help="explicit DataLoader worker override")
     parser.add_argument("--selection-split", choices=("val", "test"), default=None)
     parser.add_argument("--run-dir", default=None, help="explicit output directory override")
+    parser.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="optional model checkpoint used only to initialize weights; optimizer starts fresh",
+    )
     args = parser.parse_args()
     config = _load_config(args.config)
     if args.max_iters is not None:
@@ -531,7 +692,7 @@ def main() -> None:
         device = torch.device(args.device)
     else:
         device = torch.device(config.get("runtime", {}).get("device", "cuda" if torch.cuda.is_available() else "cpu"))
-    run(config, device, smoke=args.smoke)
+    run(config, device, smoke=args.smoke, init_checkpoint=args.init_checkpoint)
 
 
 if __name__ == "__main__":

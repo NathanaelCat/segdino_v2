@@ -68,6 +68,8 @@ def build_model(model_config: ModelConfig, device: str) -> Tuple[torch.nn.Module
         wcf_enabled=getattr(model_config, "wcf_enabled", False),
         wcf_reduction=getattr(model_config, "wcf_reduction", 4),
         wcf_alpha_init=getattr(model_config, "wcf_alpha_init", 1e-2),
+        decoder_variant=getattr(model_config, "decoder_variant", "tpa_sad"),
+        spatial_stride=getattr(model_config, "spatial_stride", 4),
     ).to(device)
     return model, backbone
 
