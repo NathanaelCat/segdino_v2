@@ -1,0 +1,934 @@
+{
+  "status": "PASS",
+  "git_commit": "e9be31813aa251afa211bbdddcbbe0e9dc493ac3",
+  "git_status_note": "preflight ran with existing worktree changes; no reset/stash/merge/checkout performed",
+  "parent": {
+    "name": "B1 = TPA(PR)+MS-MLP",
+    "config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_tpa_base_msmlp_osd_512.json",
+    "fresh_initialization": "/home/zhengshijie/workspace/OSD/segdino_v2/work_dirs/dino_tpa_dpa_msmlp_clean_common_init_seed20260901.pth",
+    "test_reference_mIoU3": 90.387709
+  },
+  "configs": {
+    "b1": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_tpa_base_msmlp_osd_512.json",
+    "B2PS": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_patch_dpa_shared_osd_512.json",
+    "B2PI": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_patch_dpa_independent_osd_512.json",
+    "B1_vs_B2PS_outside_variant_diff": [],
+    "B2PS_vs_B2PI_outside_variant_diff": []
+  },
+  "gpu_allocation": {
+    "B2PS": {
+      "device": "cuda:0",
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 4090",
+      "free_mib_before": 30753.0,
+      "total_mib": 48519.06
+    },
+    "B2PI": {
+      "device": "cuda:1",
+      "index": 1,
+      "name": "NVIDIA GeForce RTX 4090",
+      "free_mib_before": 30753.0,
+      "total_mib": 48519.06
+    }
+  },
+  "checks": {
+    "config_common_protocol_exact": true,
+    "two_distinct_cuda_devices": true,
+    "B2PS": {
+      "backbone_frozen": true,
+      "patch_embed_frozen": true,
+      "alpha_zero_logits_equivalent": true,
+      "normal_diagnostic_equivalent": true,
+      "alpha_learnable_at_zero": true,
+      "phi_zero_at_zero": true,
+      "adapter_zero_at_zero": true,
+      "phi_opens_at_1e-3": true,
+      "adapter_opens_at_1e-3": true
+    },
+    "B2PI": {
+      "backbone_frozen": true,
+      "patch_embed_frozen": true,
+      "alpha_zero_logits_equivalent": true,
+      "normal_diagnostic_equivalent": true,
+      "alpha_learnable_at_zero": true,
+      "phi_zero_at_zero": true,
+      "adapter_zero_at_zero": true,
+      "phi_opens_at_1e-3": true,
+      "adapter_opens_at_1e-3": true
+    },
+    "parameter_counts": {
+      "B1_total_exact": true,
+      "B1_trainable_exact": true,
+      "B2PS_total_exact": true,
+      "B2PS_trainable_exact": true,
+      "B2PI_total_exact": true,
+      "B2PI_trainable_exact": true,
+      "B2PS_delta_exact": true,
+      "B2PI_delta_exact": true
+    }
+  },
+  "B2PS": {
+    "label": "B2PS",
+    "variant": "patch_dpa_shared",
+    "device": "cuda:0",
+    "gpu": {
+      "device": "cuda:0",
+      "index": 0,
+      "name": "NVIDIA GeForce RTX 4090",
+      "free_mib_before": 29053.0,
+      "total_mib": 48519.06
+    },
+    "forward_data_flow": "input 512x512 -> frozen DINOv3-S/16 -> native patch-only [L3,L6,L9,L12] tokens -> B1 token projections Xi -> raw pre-transformer backbone.patch_embed.proj E -> PatchAdapter(s) P -> depth alignments Qi -> cosine DPA-Cal for all four depths -> unchanged B1 TPA/PR -> unchanged B1 MS-MLP -> 1x1 classifier -> bilinear 512x512",
+    "input_shape": [
+      1,
+      3,
+      512,
+      512
+    ],
+    "patch_embed": {
+      "source": "backbone.patch_embed.proj(x), before PatchEmbed flatten/norm and before Transformer",
+      "kernel_size": [
+        16,
+        16
+      ],
+      "stride": [
+        16,
+        16
+      ],
+      "padding": [
+        0,
+        0
+      ],
+      "raw_E_shape": [
+        1,
+        384,
+        32,
+        32
+      ],
+      "direct_proj_max_abs_diff": 0.0,
+      "registered_weight_names": [
+        "backbone.patch_embed.proj.weight",
+        "backbone.patch_embed.proj.bias"
+      ],
+      "decoder_owns_separate_patch_projection": false,
+      "decoder_patch_projection_parameter_names": []
+    },
+    "features": {
+      "intermediate_raw_token_shapes": [
+        [
+          1,
+          1024,
+          384
+        ],
+        [
+          1,
+          1024,
+          384
+        ],
+        [
+          1,
+          1024,
+          384
+        ],
+        [
+          1,
+          1024,
+          384
+        ]
+      ],
+      "image_token_rule": "_tokens_to_feature_map retains the final 32*32 patch tokens; CLS/register tokens are excluded",
+      "Xi_shapes": [
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ]
+      ],
+      "Qi_shapes": [
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ]
+      ],
+      "Si_shapes": [
+        [
+          1,
+          1,
+          32,
+          32
+        ],
+        [
+          1,
+          1,
+          32,
+          32
+        ],
+        [
+          1,
+          1,
+          32,
+          32
+        ],
+        [
+          1,
+          1,
+          32,
+          32
+        ]
+      ],
+      "P_shapes": [
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ]
+      ],
+      "final_logits_shape": [
+        1,
+        4,
+        512,
+        512
+      ],
+      "diagnostic_logits_shape": [
+        1,
+        4,
+        512,
+        512
+      ]
+    },
+    "frozen_checks": {
+      "backbone_frozen": true,
+      "patch_embed_frozen": true,
+      "patch_projection_weight_requires_grad": false,
+      "backbone_grads_none_at_alpha_zero": true,
+      "backbone_grads_none_at_alpha_1e-3": true,
+      "shared_patch_projection_source": "same backbone.patch_embed.proj module and weight; no decoder copy"
+    },
+    "alpha_zero": {
+      "alpha_3": 0.0,
+      "alpha_6": 0.0,
+      "alpha_9": 0.0,
+      "alpha_12": 0.0
+    },
+    "equivalence": {
+      "alpha_zero_logits_max_abs_diff_vs_b1": 0.0,
+      "normal_vs_diagnostic_logits_max_abs_diff": 0.0,
+      "required_tolerance": "near floating-point zero"
+    },
+    "learnability": {
+      "loss_at_alpha_zero": 0.003899412229657173,
+      "alpha_grad_norms_at_zero": {
+        "alpha_3": 7.622240809723735e-05,
+        "alpha_6": 0.00010893875150941312,
+        "alpha_9": 0.00011748484394047409,
+        "alpha_12": 3.075955100939609e-05
+      },
+      "phi_grad_norms_at_zero": {
+        "0.weight": 0.0,
+        "1.weight": 0.0,
+        "2.weight": 0.0,
+        "3.weight": 0.0
+      },
+      "adapter_grad_norms_at_zero": {
+        "shared": {
+          "in_projection.weight": 0.0,
+          "depthwise.weight": 0.0,
+          "out_projection.weight": 0.0
+        }
+      },
+      "alpha_grad_finite_nonzero_at_zero": true,
+      "phi_grad_zero_at_zero": true,
+      "adapter_grad_zero_at_zero": true,
+      "loss_at_alpha_1e-3": 0.0038993596099317074,
+      "phi_grad_norms_at_1e-3": {
+        "0.weight": 3.2090658805827843e-06,
+        "1.weight": 3.37358733304427e-06,
+        "2.weight": 3.0604091989516746e-06,
+        "3.weight": 2.987543666677084e-06
+      },
+      "adapter_grad_norms_at_1e-3": {
+        "shared": {
+          "in_projection.weight": 7.866563464631326e-06,
+          "depthwise.weight": 1.8704446347328485e-07,
+          "out_projection.weight": 9.86326426755113e-07
+        }
+      },
+      "phi_grad_finite_nonzero_at_1e-3": true,
+      "adapter_grad_finite_nonzero_at_1e-3": true
+    },
+    "parameters": {
+      "total": 25308552,
+      "backbone": 21601152,
+      "decoder": 3707400,
+      "trainable": 3707400,
+      "b1_reference_total": 24880260,
+      "b1_reference_backbone": 21601152,
+      "b1_reference_decoder": 3279108,
+      "b1_reference_trainable": 3279108,
+      "trainable_delta_vs_b1": 428292,
+      "adapter_identity_separate_from_shared": true
+    },
+    "optimizer": {
+      "name": "AdamW",
+      "groups": [
+        {
+          "lr": 0.0001,
+          "weight_decay": 0.0001,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "parameter_count": 31,
+          "parameter_names": [
+            "decoder.alpha_3",
+            "decoder.alpha_6",
+            "decoder.alpha_9",
+            "decoder.alpha_12",
+            "decoder.token_projections.0.weight",
+            "decoder.token_projections.1.weight",
+            "decoder.token_projections.2.weight",
+            "decoder.token_projections.3.weight",
+            "decoder.tpa_branch_1.conv.weight",
+            "decoder.tpa_branch_2.conv.weight",
+            "decoder.tpa_branch_3.conv.weight",
+            "decoder.tpa_branch_4.conv.weight",
+            "decoder.ms_mlp.projections.0.weight",
+            "decoder.ms_mlp.projections.0.bias",
+            "decoder.ms_mlp.projections.1.weight",
+            "decoder.ms_mlp.projections.1.bias",
+            "decoder.ms_mlp.projections.2.weight",
+            "decoder.ms_mlp.projections.2.bias",
+            "decoder.ms_mlp.projections.3.weight",
+            "decoder.ms_mlp.projections.3.bias",
+            "decoder.ms_mlp.fusion.weight",
+            "decoder.ms_mlp.fusion.bias",
+            "decoder.ms_mlp.classifier.weight",
+            "decoder.ms_mlp.classifier.bias",
+            "decoder.patch_adapter.in_projection.weight",
+            "decoder.patch_adapter.depthwise.weight",
+            "decoder.patch_adapter.out_projection.weight",
+            "decoder.depth_alignments.0.weight",
+            "decoder.depth_alignments.1.weight",
+            "decoder.depth_alignments.2.weight",
+            "decoder.depth_alignments.3.weight"
+          ]
+        }
+      ],
+      "all_trainable_names_match": {
+        "optimizer": [
+          "decoder.alpha_12",
+          "decoder.alpha_3",
+          "decoder.alpha_6",
+          "decoder.alpha_9",
+          "decoder.depth_alignments.0.weight",
+          "decoder.depth_alignments.1.weight",
+          "decoder.depth_alignments.2.weight",
+          "decoder.depth_alignments.3.weight",
+          "decoder.ms_mlp.classifier.bias",
+          "decoder.ms_mlp.classifier.weight",
+          "decoder.ms_mlp.fusion.bias",
+          "decoder.ms_mlp.fusion.weight",
+          "decoder.ms_mlp.projections.0.bias",
+          "decoder.ms_mlp.projections.0.weight",
+          "decoder.ms_mlp.projections.1.bias",
+          "decoder.ms_mlp.projections.1.weight",
+          "decoder.ms_mlp.projections.2.bias",
+          "decoder.ms_mlp.projections.2.weight",
+          "decoder.ms_mlp.projections.3.bias",
+          "decoder.ms_mlp.projections.3.weight",
+          "decoder.patch_adapter.depthwise.weight",
+          "decoder.patch_adapter.in_projection.weight",
+          "decoder.patch_adapter.out_projection.weight",
+          "decoder.token_projections.0.weight",
+          "decoder.token_projections.1.weight",
+          "decoder.token_projections.2.weight",
+          "decoder.token_projections.3.weight",
+          "decoder.tpa_branch_1.conv.weight",
+          "decoder.tpa_branch_2.conv.weight",
+          "decoder.tpa_branch_3.conv.weight",
+          "decoder.tpa_branch_4.conv.weight"
+        ],
+        "model": [
+          "decoder.alpha_12",
+          "decoder.alpha_3",
+          "decoder.alpha_6",
+          "decoder.alpha_9",
+          "decoder.depth_alignments.0.weight",
+          "decoder.depth_alignments.1.weight",
+          "decoder.depth_alignments.2.weight",
+          "decoder.depth_alignments.3.weight",
+          "decoder.ms_mlp.classifier.bias",
+          "decoder.ms_mlp.classifier.weight",
+          "decoder.ms_mlp.fusion.bias",
+          "decoder.ms_mlp.fusion.weight",
+          "decoder.ms_mlp.projections.0.bias",
+          "decoder.ms_mlp.projections.0.weight",
+          "decoder.ms_mlp.projections.1.bias",
+          "decoder.ms_mlp.projections.1.weight",
+          "decoder.ms_mlp.projections.2.bias",
+          "decoder.ms_mlp.projections.2.weight",
+          "decoder.ms_mlp.projections.3.bias",
+          "decoder.ms_mlp.projections.3.weight",
+          "decoder.patch_adapter.depthwise.weight",
+          "decoder.patch_adapter.in_projection.weight",
+          "decoder.patch_adapter.out_projection.weight",
+          "decoder.token_projections.0.weight",
+          "decoder.token_projections.1.weight",
+          "decoder.token_projections.2.weight",
+          "decoder.token_projections.3.weight",
+          "decoder.tpa_branch_1.conv.weight",
+          "decoder.tpa_branch_2.conv.weight",
+          "decoder.tpa_branch_3.conv.weight",
+          "decoder.tpa_branch_4.conv.weight"
+        ]
+      }
+    },
+    "initialization": {
+      "source": "work_dirs/dino_tpa_dpa_msmlp_clean_common_init_seed20260901.pth",
+      "loaded_missing_new_keys": [
+        "decoder.alpha_12",
+        "decoder.alpha_3",
+        "decoder.alpha_6",
+        "decoder.alpha_9",
+        "decoder.depth_alignments.0.weight",
+        "decoder.depth_alignments.1.weight",
+        "decoder.depth_alignments.2.weight",
+        "decoder.depth_alignments.3.weight",
+        "decoder.patch_adapter.depthwise.weight",
+        "decoder.patch_adapter.in_projection.weight",
+        "decoder.patch_adapter.out_projection.weight"
+      ],
+      "optimizer_fresh": true,
+      "alpha_reset_after_gradient_check": true
+    },
+    "saved_initialization_checkpoint": "/home/zhengshijie/workspace/OSD/segdino_v2/work_dirs/dino_patch_dpa_shared_common_init_seed20260901.pth",
+    "memory": {
+      "peak_allocated_mib": 1154.06,
+      "free_mib_after": 29253.0
+    }
+  },
+  "B2PI": {
+    "label": "B2PI",
+    "variant": "patch_dpa_independent",
+    "device": "cuda:1",
+    "gpu": {
+      "device": "cuda:1",
+      "index": 1,
+      "name": "NVIDIA GeForce RTX 4090",
+      "free_mib_before": 29035.0,
+      "total_mib": 48519.06
+    },
+    "forward_data_flow": "input 512x512 -> frozen DINOv3-S/16 -> native patch-only [L3,L6,L9,L12] tokens -> B1 token projections Xi -> raw pre-transformer backbone.patch_embed.proj E -> PatchAdapter(s) P -> depth alignments Qi -> cosine DPA-Cal for all four depths -> unchanged B1 TPA/PR -> unchanged B1 MS-MLP -> 1x1 classifier -> bilinear 512x512",
+    "input_shape": [
+      1,
+      3,
+      512,
+      512
+    ],
+    "patch_embed": {
+      "source": "backbone.patch_embed.proj(x), before PatchEmbed flatten/norm and before Transformer",
+      "kernel_size": [
+        16,
+        16
+      ],
+      "stride": [
+        16,
+        16
+      ],
+      "padding": [
+        0,
+        0
+      ],
+      "raw_E_shape": [
+        1,
+        384,
+        32,
+        32
+      ],
+      "direct_proj_max_abs_diff": 0.0,
+      "registered_weight_names": [
+        "backbone.patch_embed.proj.weight",
+        "backbone.patch_embed.proj.bias"
+      ],
+      "decoder_owns_separate_patch_projection": false,
+      "decoder_patch_projection_parameter_names": []
+    },
+    "features": {
+      "intermediate_raw_token_shapes": [
+        [
+          1,
+          1024,
+          384
+        ],
+        [
+          1,
+          1024,
+          384
+        ],
+        [
+          1,
+          1024,
+          384
+        ],
+        [
+          1,
+          1024,
+          384
+        ]
+      ],
+      "image_token_rule": "_tokens_to_feature_map retains the final 32*32 patch tokens; CLS/register tokens are excluded",
+      "Xi_shapes": [
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ]
+      ],
+      "Qi_shapes": [
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ]
+      ],
+      "Si_shapes": [
+        [
+          1,
+          1,
+          32,
+          32
+        ],
+        [
+          1,
+          1,
+          32,
+          32
+        ],
+        [
+          1,
+          1,
+          32,
+          32
+        ],
+        [
+          1,
+          1,
+          32,
+          32
+        ]
+      ],
+      "P_shapes": [
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ],
+        [
+          1,
+          256,
+          32,
+          32
+        ]
+      ],
+      "final_logits_shape": [
+        1,
+        4,
+        512,
+        512
+      ],
+      "diagnostic_logits_shape": [
+        1,
+        4,
+        512,
+        512
+      ]
+    },
+    "frozen_checks": {
+      "backbone_frozen": true,
+      "patch_embed_frozen": true,
+      "patch_projection_weight_requires_grad": false,
+      "backbone_grads_none_at_alpha_zero": true,
+      "backbone_grads_none_at_alpha_1e-3": true,
+      "shared_patch_projection_source": "same backbone.patch_embed.proj module and weight; no decoder copy"
+    },
+    "alpha_zero": {
+      "alpha_3": 0.0,
+      "alpha_6": 0.0,
+      "alpha_9": 0.0,
+      "alpha_12": 0.0
+    },
+    "equivalence": {
+      "alpha_zero_logits_max_abs_diff_vs_b1": 0.0,
+      "normal_vs_diagnostic_logits_max_abs_diff": 0.0,
+      "required_tolerance": "near floating-point zero"
+    },
+    "learnability": {
+      "loss_at_alpha_zero": 0.003899412229657173,
+      "alpha_grad_norms_at_zero": {
+        "alpha_3": 7.622239354532212e-05,
+        "alpha_6": 0.00010893874423345551,
+        "alpha_9": 0.00011748469842132181,
+        "alpha_12": 3.0759882065467536e-05
+      },
+      "phi_grad_norms_at_zero": {
+        "0.weight": 0.0,
+        "1.weight": 0.0,
+        "2.weight": 0.0,
+        "3.weight": 0.0
+      },
+      "adapter_grad_norms_at_zero": {
+        "independent_0": {
+          "in_projection.weight": 0.0,
+          "depthwise.weight": 0.0,
+          "out_projection.weight": 0.0
+        },
+        "independent_1": {
+          "in_projection.weight": 0.0,
+          "depthwise.weight": 0.0,
+          "out_projection.weight": 0.0
+        },
+        "independent_2": {
+          "in_projection.weight": 0.0,
+          "depthwise.weight": 0.0,
+          "out_projection.weight": 0.0
+        },
+        "independent_3": {
+          "in_projection.weight": 0.0,
+          "depthwise.weight": 0.0,
+          "out_projection.weight": 0.0
+        }
+      },
+      "alpha_grad_finite_nonzero_at_zero": true,
+      "phi_grad_zero_at_zero": true,
+      "adapter_grad_zero_at_zero": true,
+      "loss_at_alpha_1e-3": 0.0038993596099317074,
+      "phi_grad_norms_at_1e-3": {
+        "0.weight": 3.2090658805827843e-06,
+        "1.weight": 3.3735871056705946e-06,
+        "2.weight": 3.0604107905674027e-06,
+        "3.weight": 2.9875441214244347e-06
+      },
+      "adapter_grad_norms_at_1e-3": {
+        "independent_0": {
+          "in_projection.weight": 3.7804020394105464e-06,
+          "depthwise.weight": 9.800835698570154e-08,
+          "out_projection.weight": 4.813900318367814e-07
+        },
+        "independent_1": {
+          "in_projection.weight": 4.189918399788439e-06,
+          "depthwise.weight": 1.0522144577862491e-07,
+          "out_projection.weight": 5.33255047230341e-07
+        },
+        "independent_2": {
+          "in_projection.weight": 3.7931615679553943e-06,
+          "depthwise.weight": 8.051870992176191e-08,
+          "out_projection.weight": 4.7538480885123136e-07
+        },
+        "independent_3": {
+          "in_projection.weight": 3.615786454247427e-06,
+          "depthwise.weight": 7.840604610009905e-08,
+          "out_projection.weight": 4.5650688207388157e-07
+        }
+      },
+      "phi_grad_finite_nonzero_at_1e-3": true,
+      "adapter_grad_finite_nonzero_at_1e-3": true
+    },
+    "parameters": {
+      "total": 25806984,
+      "backbone": 21601152,
+      "decoder": 4205832,
+      "trainable": 4205832,
+      "b1_reference_total": 24880260,
+      "b1_reference_backbone": 21601152,
+      "b1_reference_decoder": 3279108,
+      "b1_reference_trainable": 3279108,
+      "trainable_delta_vs_b1": 926724,
+      "adapter_identity_separate_from_shared": true
+    },
+    "optimizer": {
+      "name": "AdamW",
+      "groups": [
+        {
+          "lr": 0.0001,
+          "weight_decay": 0.0001,
+          "betas": [
+            0.9,
+            0.999
+          ],
+          "parameter_count": 40,
+          "parameter_names": [
+            "decoder.alpha_3",
+            "decoder.alpha_6",
+            "decoder.alpha_9",
+            "decoder.alpha_12",
+            "decoder.token_projections.0.weight",
+            "decoder.token_projections.1.weight",
+            "decoder.token_projections.2.weight",
+            "decoder.token_projections.3.weight",
+            "decoder.tpa_branch_1.conv.weight",
+            "decoder.tpa_branch_2.conv.weight",
+            "decoder.tpa_branch_3.conv.weight",
+            "decoder.tpa_branch_4.conv.weight",
+            "decoder.ms_mlp.projections.0.weight",
+            "decoder.ms_mlp.projections.0.bias",
+            "decoder.ms_mlp.projections.1.weight",
+            "decoder.ms_mlp.projections.1.bias",
+            "decoder.ms_mlp.projections.2.weight",
+            "decoder.ms_mlp.projections.2.bias",
+            "decoder.ms_mlp.projections.3.weight",
+            "decoder.ms_mlp.projections.3.bias",
+            "decoder.ms_mlp.fusion.weight",
+            "decoder.ms_mlp.fusion.bias",
+            "decoder.ms_mlp.classifier.weight",
+            "decoder.ms_mlp.classifier.bias",
+            "decoder.patch_adapters.0.in_projection.weight",
+            "decoder.patch_adapters.0.depthwise.weight",
+            "decoder.patch_adapters.0.out_projection.weight",
+            "decoder.patch_adapters.1.in_projection.weight",
+            "decoder.patch_adapters.1.depthwise.weight",
+            "decoder.patch_adapters.1.out_projection.weight",
+            "decoder.patch_adapters.2.in_projection.weight",
+            "decoder.patch_adapters.2.depthwise.weight",
+            "decoder.patch_adapters.2.out_projection.weight",
+            "decoder.patch_adapters.3.in_projection.weight",
+            "decoder.patch_adapters.3.depthwise.weight",
+            "decoder.patch_adapters.3.out_projection.weight",
+            "decoder.depth_alignments.0.weight",
+            "decoder.depth_alignments.1.weight",
+            "decoder.depth_alignments.2.weight",
+            "decoder.depth_alignments.3.weight"
+          ]
+        }
+      ],
+      "all_trainable_names_match": {
+        "optimizer": [
+          "decoder.alpha_12",
+          "decoder.alpha_3",
+          "decoder.alpha_6",
+          "decoder.alpha_9",
+          "decoder.depth_alignments.0.weight",
+          "decoder.depth_alignments.1.weight",
+          "decoder.depth_alignments.2.weight",
+          "decoder.depth_alignments.3.weight",
+          "decoder.ms_mlp.classifier.bias",
+          "decoder.ms_mlp.classifier.weight",
+          "decoder.ms_mlp.fusion.bias",
+          "decoder.ms_mlp.fusion.weight",
+          "decoder.ms_mlp.projections.0.bias",
+          "decoder.ms_mlp.projections.0.weight",
+          "decoder.ms_mlp.projections.1.bias",
+          "decoder.ms_mlp.projections.1.weight",
+          "decoder.ms_mlp.projections.2.bias",
+          "decoder.ms_mlp.projections.2.weight",
+          "decoder.ms_mlp.projections.3.bias",
+          "decoder.ms_mlp.projections.3.weight",
+          "decoder.patch_adapters.0.depthwise.weight",
+          "decoder.patch_adapters.0.in_projection.weight",
+          "decoder.patch_adapters.0.out_projection.weight",
+          "decoder.patch_adapters.1.depthwise.weight",
+          "decoder.patch_adapters.1.in_projection.weight",
+          "decoder.patch_adapters.1.out_projection.weight",
+          "decoder.patch_adapters.2.depthwise.weight",
+          "decoder.patch_adapters.2.in_projection.weight",
+          "decoder.patch_adapters.2.out_projection.weight",
+          "decoder.patch_adapters.3.depthwise.weight",
+          "decoder.patch_adapters.3.in_projection.weight",
+          "decoder.patch_adapters.3.out_projection.weight",
+          "decoder.token_projections.0.weight",
+          "decoder.token_projections.1.weight",
+          "decoder.token_projections.2.weight",
+          "decoder.token_projections.3.weight",
+          "decoder.tpa_branch_1.conv.weight",
+          "decoder.tpa_branch_2.conv.weight",
+          "decoder.tpa_branch_3.conv.weight",
+          "decoder.tpa_branch_4.conv.weight"
+        ],
+        "model": [
+          "decoder.alpha_12",
+          "decoder.alpha_3",
+          "decoder.alpha_6",
+          "decoder.alpha_9",
+          "decoder.depth_alignments.0.weight",
+          "decoder.depth_alignments.1.weight",
+          "decoder.depth_alignments.2.weight",
+          "decoder.depth_alignments.3.weight",
+          "decoder.ms_mlp.classifier.bias",
+          "decoder.ms_mlp.classifier.weight",
+          "decoder.ms_mlp.fusion.bias",
+          "decoder.ms_mlp.fusion.weight",
+          "decoder.ms_mlp.projections.0.bias",
+          "decoder.ms_mlp.projections.0.weight",
+          "decoder.ms_mlp.projections.1.bias",
+          "decoder.ms_mlp.projections.1.weight",
+          "decoder.ms_mlp.projections.2.bias",
+          "decoder.ms_mlp.projections.2.weight",
+          "decoder.ms_mlp.projections.3.bias",
+          "decoder.ms_mlp.projections.3.weight",
+          "decoder.patch_adapters.0.depthwise.weight",
+          "decoder.patch_adapters.0.in_projection.weight",
+          "decoder.patch_adapters.0.out_projection.weight",
+          "decoder.patch_adapters.1.depthwise.weight",
+          "decoder.patch_adapters.1.in_projection.weight",
+          "decoder.patch_adapters.1.out_projection.weight",
+          "decoder.patch_adapters.2.depthwise.weight",
+          "decoder.patch_adapters.2.in_projection.weight",
+          "decoder.patch_adapters.2.out_projection.weight",
+          "decoder.patch_adapters.3.depthwise.weight",
+          "decoder.patch_adapters.3.in_projection.weight",
+          "decoder.patch_adapters.3.out_projection.weight",
+          "decoder.token_projections.0.weight",
+          "decoder.token_projections.1.weight",
+          "decoder.token_projections.2.weight",
+          "decoder.token_projections.3.weight",
+          "decoder.tpa_branch_1.conv.weight",
+          "decoder.tpa_branch_2.conv.weight",
+          "decoder.tpa_branch_3.conv.weight",
+          "decoder.tpa_branch_4.conv.weight"
+        ]
+      }
+    },
+    "initialization": {
+      "source": "work_dirs/dino_tpa_dpa_msmlp_clean_common_init_seed20260901.pth",
+      "loaded_missing_new_keys": [
+        "decoder.alpha_12",
+        "decoder.alpha_3",
+        "decoder.alpha_6",
+        "decoder.alpha_9",
+        "decoder.depth_alignments.0.weight",
+        "decoder.depth_alignments.1.weight",
+        "decoder.depth_alignments.2.weight",
+        "decoder.depth_alignments.3.weight",
+        "decoder.patch_adapters.0.depthwise.weight",
+        "decoder.patch_adapters.0.in_projection.weight",
+        "decoder.patch_adapters.0.out_projection.weight",
+        "decoder.patch_adapters.1.depthwise.weight",
+        "decoder.patch_adapters.1.in_projection.weight",
+        "decoder.patch_adapters.1.out_projection.weight",
+        "decoder.patch_adapters.2.depthwise.weight",
+        "decoder.patch_adapters.2.in_projection.weight",
+        "decoder.patch_adapters.2.out_projection.weight",
+        "decoder.patch_adapters.3.depthwise.weight",
+        "decoder.patch_adapters.3.in_projection.weight",
+        "decoder.patch_adapters.3.out_projection.weight"
+      ],
+      "optimizer_fresh": true,
+      "alpha_reset_after_gradient_check": true
+    },
+    "saved_initialization_checkpoint": "/home/zhengshijie/workspace/OSD/segdino_v2/work_dirs/dino_patch_dpa_independent_common_init_seed20260901.pth",
+    "memory": {
+      "peak_allocated_mib": 1170.96,
+      "free_mib_after": 29715.0
+    }
+  },
+  "formal_training_started": false,
+  "next_action": "Stop after preflight; formal 50-epoch training requires explicit confirmation after this report."
+}
