@@ -187,6 +187,20 @@ def _summarize_patch_sad_trace(model: nn.Module, trace: dict[str, Any]) -> dict[
     }
 
 
+def _summarize_ltp_cli_gammas(model: nn.Module) -> dict[str, float]:
+    """Read the four CLI residual scales without changing the forward path."""
+    decoder = getattr(model, "decoder", None)
+    cli = getattr(decoder, "cli", None)
+    gammas = getattr(cli, "gammas", None)
+    if gammas is None or len(gammas) != 4:
+        raise RuntimeError("LTP-CLI gamma logging requires four CLI gamma parameters")
+    names = ("gamma_3", "gamma_6", "gamma_9", "gamma_12")
+    return {
+        name: float(value.detach().float().item())
+        for name, value in zip(names, gammas)
+    }
+
+
 def _seed_everything(seed: int, deterministic: bool, cudnn_benchmark: bool) -> None:
     if deterministic and cudnn_benchmark:
         raise ValueError("deterministic=True and cudnn_benchmark=True are contradictory")
@@ -667,6 +681,7 @@ def run(
     best_value = float("-inf")
     best_routing_weights = None
     best_dpa_stats = None
+    best_ltp_cli_gammas = None
     best_path = run_dir / "best.pth"
     latest_path = run_dir / "latest.pth"
     loader_iter = iter(train_loader)
@@ -766,6 +781,10 @@ def run(
             }
             if dpa_stats is not None:
                 record["dpa_stats"] = dpa_stats
+            ltp_cli_gammas = None
+            if model_cfg.decoder_variant == "ltp_cli":
+                ltp_cli_gammas = _summarize_ltp_cli_gammas(model)
+                record["ltp_cli_gammas"] = ltp_cli_gammas
             routing_w = model.get_routing_weights()
             if routing_w is not None:
                 rw_np = routing_w.detach().cpu().numpy()
@@ -804,6 +823,12 @@ def run(
                     )
                     log_print(f"  DPA cosine: {cosine_str}")
                     log_print(f"  DPA residual_ratio: {residual_str}")
+            if ltp_cli_gammas is not None:
+                gamma_str = " ".join(
+                    f"{name}={value:.6f}"
+                    for name, value in ltp_cli_gammas.items()
+                )
+                log_print(f"  LTP-CLI gamma: {gamma_str}")
             if routing_w is not None and model_cfg.readout_mode in ("matrix", "uniform"):
                 rw_str = " | ".join([f"s{s}:[" + " ".join([f"{w:.2f}" for w in rw_np[s]]) + "]" for s in range(rw_np.shape[0])])
                 log_print(f"  ALSR Routing: {rw_str}")
@@ -814,6 +839,7 @@ def run(
             if np.isfinite(score) and score > best_value:
                 best_value = score
                 best_dpa_stats = dpa_stats
+                best_ltp_cli_gammas = ltp_cli_gammas
                 if routing_w is not None:
                     best_routing_weights = rw_np.tolist()
                 _save_checkpoint(
@@ -859,6 +885,17 @@ def run(
     } and history:
         summary["dpa_diagnostics_last"] = history[-1].get("dpa_stats")
         summary["dpa_diagnostics_best"] = best_dpa_stats
+    if model_cfg.decoder_variant == "ltp_cli" and history:
+        summary["ltp_cli_gamma_trajectory"] = [
+            {
+                "epoch": item["epoch"],
+                "step": item["step"],
+                **item["ltp_cli_gammas"],
+            }
+            for item in history
+            if "ltp_cli_gammas" in item
+        ]
+        summary["ltp_cli_gamma_best"] = best_ltp_cli_gammas
     if model_cfg.adaptive_readout:
         final_rw = model.get_routing_weights()
         if final_rw is not None:
