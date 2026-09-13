@@ -650,6 +650,14 @@ def run(
             "RGB LTP produces S4/S8/S16 memory [16384+4096+1024,64]; "
             "four DINO levels read it with shared-K/V ReLU linear cross interaction"
         )
+    elif model_cfg.decoder_variant in {"spm_ccfm_sad", "spm_ccfm_ms_mlp"}:
+        backend = "original SAD" if model_cfg.decoder_variant == "spm_ccfm_sad" else "original MS-MLP"
+        log_print(
+            f"decoder_variant={model_cfg.decoder_variant}; RGB Lite-SPM produces "
+            "D2/D4/D8=256/128/64; DINO L12 supplies D16=32; four-scale "
+            f"RT-DETR CCFM outputs C2/C4/C8/C16; backend={backend}; "
+            "no TPA/PR and no detection/query head"
+        )
 
     epochs = training.get("epochs")
     max_iters = training.get("max_iters")

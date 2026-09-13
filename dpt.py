@@ -9,6 +9,7 @@ PATCH_DPA_VARIANTS = {"patch_dpa_shared", "patch_dpa_independent"}
 PATCH_GUIDED_SAD_VARIANTS = {"patch_guided_sad"}
 PATCH_PRIOR_VARIANTS = PATCH_DPA_VARIANTS | PATCH_GUIDED_SAD_VARIANTS
 LTP_CLI_VARIANTS = {"ltp_cli"}
+SPM_CCFM_VARIANTS = {"spm_ccfm_sad", "spm_ccfm_ms_mlp"}
 
 
 class L12AnchoredWCF(nn.Module):
@@ -479,6 +480,318 @@ class MultiScaleMLPFusion(nn.Module):
         ]
         fused = self.activation(self.fusion(torch.cat(aligned, dim=1)))
         return self.classifier(fused)
+
+
+class LiteSpatialPriorStem(nn.Module):
+    """Trainable RGB-only spatial-prior stem for the SPM/CCFM experiments.
+
+    The stem is deliberately separate from the frozen DINOv3 path.  It uses
+    three successive 3x3, stride-2 convolutions, yielding genuine RGB maps at
+    1/2, 1/4, and 1/8 of the input resolution.  The fourth 1/16 input to CCFM
+    is supplied by the DINOv3 L12 feature map.
+    """
+
+    def __init__(self, in_channels=3, channels=(32, 64, 128)):
+        super().__init__()
+        layers = []
+        current = int(in_channels)
+        for output_channels in channels:
+            output_channels = int(output_channels)
+            layers.append(
+                nn.Sequential(
+                    nn.Conv2d(current, output_channels, kernel_size=3, stride=2, padding=1, bias=False),
+                    nn.BatchNorm2d(output_channels),
+                    nn.ReLU(inplace=True),
+                )
+            )
+            current = output_channels
+        self.layers = nn.ModuleList(layers)
+        self.out_channels = tuple(int(value) for value in channels)
+
+    def forward(self, x):
+        outputs = []
+        for layer in self.layers:
+            x = layer(x)
+            outputs.append(x)
+        return tuple(outputs)
+
+
+class RTDETRConvNormLayer(nn.Module):
+    """The ConvNormLayer used by the official RT-DETR HybridEncoder."""
+
+    def __init__(self, ch_in, ch_out, kernel_size, stride, padding=None, bias=False, act=None):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            ch_in,
+            ch_out,
+            kernel_size,
+            stride,
+            padding=(kernel_size - 1) // 2 if padding is None else padding,
+            bias=bias,
+        )
+        self.norm = nn.BatchNorm2d(ch_out)
+        if act is None or act == "identity":
+            self.act = nn.Identity()
+        elif act == "relu":
+            self.act = nn.ReLU(inplace=True)
+        elif act == "silu":
+            self.act = nn.SiLU(inplace=True)
+        else:
+            raise ValueError(f"Unsupported RT-DETR activation: {act}")
+
+    def forward(self, x):
+        return self.act(self.norm(self.conv(x)))
+
+
+class RTDETRRepVggBlock(nn.Module):
+    """Training-time RepVGG block copied from RT-DETR's CCFM path."""
+
+    def __init__(self, ch_in, ch_out, act="silu"):
+        super().__init__()
+        self.conv1 = RTDETRConvNormLayer(ch_in, ch_out, 3, 1, padding=1, act=None)
+        self.conv2 = RTDETRConvNormLayer(ch_in, ch_out, 1, 1, padding=0, act=None)
+        if act == "relu":
+            self.act = nn.ReLU(inplace=True)
+        elif act == "silu":
+            self.act = nn.SiLU(inplace=True)
+        elif act in (None, "identity"):
+            self.act = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported RT-DETR activation: {act}")
+
+    def forward(self, x):
+        return self.act(self.conv1(x) + self.conv2(x))
+
+
+class RTDETRCSPRepLayer(nn.Module):
+    """The official RT-DETR CSPRepLayer, used without detection components."""
+
+    def __init__(self, in_channels, out_channels, num_blocks=3, expansion=1.0, bias=None, act="silu"):
+        super().__init__()
+        hidden_channels = int(out_channels * expansion)
+        self.conv1 = RTDETRConvNormLayer(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
+        self.conv2 = RTDETRConvNormLayer(in_channels, hidden_channels, 1, 1, bias=bias, act=act)
+        self.bottlenecks = nn.Sequential(
+            *[
+                RTDETRRepVggBlock(hidden_channels, hidden_channels, act=act)
+                for _ in range(round(3 * 1.0) if num_blocks is None else int(num_blocks))
+            ]
+        )
+        if hidden_channels != out_channels:
+            self.conv3 = RTDETRConvNormLayer(hidden_channels, out_channels, 1, 1, bias=bias, act=act)
+        else:
+            self.conv3 = nn.Identity()
+
+    def forward(self, x):
+        x_1 = self.bottlenecks(self.conv1(x))
+        x_2 = self.conv2(x)
+        return self.conv3(x_1 + x_2)
+
+
+class FourScaleRTDETRCCFM(nn.Module):
+    """Four-scale FPN+PAN CCFM adapted from RT-DETR's HybridEncoder.
+
+    RT-DETR's released encoder is normally configured for three input levels.
+    This OSD adapter keeps its input projection, nearest-neighbor top-down
+    FPN, CSPRep blocks, stride-2 bottom-up PAN, and CSPRep blocks, while
+    extending the same loops to four ordered levels:
+    ``[1/2, 1/4, 1/8, 1/16]``.
+
+    The transformer encoder and all RT-DETR detection/query components are
+    intentionally absent.  This module is only the requested cross-scale
+    feature fusion path.
+    """
+
+    def __init__(
+        self,
+        in_channels=(32, 64, 128, 384),
+        hidden_dim=256,
+        expansion=1.0,
+        depth_mult=1.0,
+        act="silu",
+    ):
+        super().__init__()
+        if len(in_channels) != 4:
+            raise ValueError(f"FourScaleRTDETRCCFM requires four inputs, got {len(in_channels)}")
+        self.in_channels = tuple(int(value) for value in in_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.out_channels = (self.hidden_dim,) * 4
+        self.out_strides = (2, 4, 8, 16)
+
+        self.input_proj = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(channels, self.hidden_dim, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(self.hidden_dim),
+                )
+                for channels in self.in_channels
+            ]
+        )
+
+        self.lateral_convs = nn.ModuleList()
+        self.fpn_blocks = nn.ModuleList()
+        for _ in range(len(self.in_channels) - 1):
+            self.lateral_convs.append(
+                RTDETRConvNormLayer(self.hidden_dim, self.hidden_dim, 1, 1, act=act)
+            )
+            self.fpn_blocks.append(
+                RTDETRCSPRepLayer(
+                    self.hidden_dim * 2,
+                    self.hidden_dim,
+                    num_blocks=round(3 * depth_mult),
+                    expansion=expansion,
+                    act=act,
+                )
+            )
+
+        self.downsample_convs = nn.ModuleList()
+        self.pan_blocks = nn.ModuleList()
+        for _ in range(len(self.in_channels) - 1):
+            self.downsample_convs.append(
+                RTDETRConvNormLayer(self.hidden_dim, self.hidden_dim, 3, 2, act=act)
+            )
+            self.pan_blocks.append(
+                RTDETRCSPRepLayer(
+                    self.hidden_dim * 2,
+                    self.hidden_dim,
+                    num_blocks=round(3 * depth_mult),
+                    expansion=expansion,
+                    act=act,
+                )
+            )
+
+    @staticmethod
+    def _require_pair(actual, expected, context):
+        if tuple(actual) != tuple(expected):
+            raise RuntimeError(f"{context} shape mismatch: got {tuple(actual)}, expected {tuple(expected)}")
+
+    def forward(self, features):
+        if len(features) != 4:
+            raise ValueError(f"FourScaleRTDETRCCFM requires four feature maps, got {len(features)}")
+        proj_feats = [projection(feature) for projection, feature in zip(self.input_proj, features)]
+
+        inner_outs = [proj_feats[-1]]
+        for idx in range(len(self.in_channels) - 1, 0, -1):
+            feature_high = self.lateral_convs[len(self.in_channels) - 1 - idx](inner_outs[0])
+            inner_outs[0] = feature_high
+            upsampled = F.interpolate(feature_high, scale_factor=2.0, mode="nearest")
+            feature_low = proj_feats[idx - 1]
+            self._require_pair(upsampled.shape[-2:], feature_low.shape[-2:], "CCFM top-down")
+            inner_out = self.fpn_blocks[len(self.in_channels) - 1 - idx](
+                torch.cat([upsampled, feature_low], dim=1)
+            )
+            inner_outs.insert(0, inner_out)
+
+        outputs = [inner_outs[0]]
+        for idx in range(len(self.in_channels) - 1):
+            feature_low = outputs[-1]
+            feature_high = inner_outs[idx + 1]
+            downsampled = self.downsample_convs[idx](feature_low)
+            self._require_pair(downsampled.shape[-2:], feature_high.shape[-2:], "CCFM bottom-up")
+            outputs.append(
+                self.pan_blocks[idx](torch.cat([downsampled, feature_high], dim=1))
+            )
+        return tuple(outputs)
+
+
+class SPMCCFMDecoderBase(nn.Module):
+    """Common RGB-SPM + four-scale CCFM front-end for both backends."""
+
+    def __init__(self, backbone_channels, decoder_channels=256):
+        super().__init__()
+        self.backbone_channels = int(backbone_channels)
+        self.decoder_channels = int(decoder_channels)
+        self.ccfm = FourScaleRTDETRCCFM(
+            in_channels=(32, 64, 128, self.backbone_channels),
+            hidden_dim=self.decoder_channels,
+        )
+
+    @staticmethod
+    def _tokens_to_feature_map(tokens, patch_h, patch_w):
+        if isinstance(tokens, (list, tuple)):
+            tokens = tokens[0]
+        num_patches = patch_h * patch_w
+        if tokens.ndim != 3:
+            raise ValueError(f"Expected token tensor with 3 dims, got shape {tuple(tokens.shape)}")
+        if tokens.shape[1] < num_patches:
+            raise ValueError(
+                f"Token count {tokens.shape[1]} is smaller than expected patch grid {num_patches}"
+            )
+        if tokens.shape[1] != num_patches:
+            tokens = tokens[:, -num_patches:, :]
+        return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[-1], patch_h, patch_w)
+
+    def build_ccfm_features(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        if len(spatial_features) != 3:
+            raise ValueError(f"SPM requires D2/D4/D8, got {len(spatial_features)} maps")
+        semantic_map = self._tokens_to_feature_map(semantic_tokens, patch_h, patch_w)
+        expected = (
+            (patch_h * 8, patch_w * 8),
+            (patch_h * 4, patch_w * 4),
+            (patch_h * 2, patch_w * 2),
+            (patch_h, patch_w),
+        )
+        actual = tuple(feature.shape[-2:] for feature in (*spatial_features, semantic_map))
+        if actual != expected:
+            raise RuntimeError(f"SPM/CCFM input scales mismatch: got {actual}, expected {expected}")
+        return self.ccfm((*spatial_features, semantic_map))
+
+
+class SPMCCFMSADDecoder(SPMCCFMDecoderBase):
+    """SPM+CCFM followed by the original OSD SAD consumer."""
+
+    def __init__(self, backbone_channels, decoder_channels=256, num_classes=4, use_group_norm=True):
+        super().__init__(backbone_channels, decoder_channels=decoder_channels)
+        self.sad_intra_1 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_intra_2 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_intra_3 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_intra_4 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_inter_4 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_inter_3 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_inter_2 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_inter_1 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.out_conv = nn.Conv2d(decoder_channels, num_classes, 1)
+
+    def forward(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        p2, p4, p8, p16 = self.build_ccfm_features(
+            semantic_tokens, spatial_features, patch_h, patch_w
+        )
+        level_1 = self.sad_intra_1(p2)
+        level_2 = self.sad_intra_2(p4)
+        level_3 = self.sad_intra_3(p8)
+        level_4 = self.sad_intra_4(p16)
+        x4 = self.sad_inter_4(level_4)
+        x3 = self.sad_inter_3(
+            F.interpolate(x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False)
+            + level_3
+        )
+        x2 = self.sad_inter_2(
+            F.interpolate(x3, size=level_2.shape[-2:], mode="bilinear", align_corners=False)
+            + level_2
+        )
+        x1 = self.sad_inter_1(
+            F.interpolate(x2, size=level_1.shape[-2:], mode="bilinear", align_corners=False)
+            + level_1
+        )
+        return self.out_conv(x1)
+
+
+class SPMCCFMMSMLPDecoder(SPMCCFMDecoderBase):
+    """SPM+CCFM followed by the existing neutral MS-MLP consumer."""
+
+    def __init__(self, backbone_channels, decoder_channels=256, num_classes=4):
+        super().__init__(backbone_channels, decoder_channels=decoder_channels)
+        self.ms_mlp = MultiScaleMLPFusion(
+            input_channels=decoder_channels,
+            decoder_channels=decoder_channels,
+            num_classes=num_classes,
+        )
+
+    def forward(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        ccfm_features = self.build_ccfm_features(
+            semantic_tokens, spatial_features, patch_h, patch_w
+        )
+        return self.ms_mlp(ccfm_features)
 
 
 class TPAMultiScaleMLPDecoder(nn.Module):
@@ -1372,6 +1685,8 @@ class DPT(nn.Module):
             "ltp_cli",
             "semantic_spatial",
             "mlp_same_scale",
+            "spm_ccfm_sad",
+            "spm_ccfm_ms_mlp",
         }:
             raise ValueError(
                 f"Unknown decoder_variant '{self.decoder_variant}'. "
@@ -1379,7 +1694,7 @@ class DPT(nn.Module):
                 "'tpa_change_cascade', "
                 "'tpa_sad_base', 'dpa_sad_base', 'patch_dpa_shared', "
                 "'patch_dpa_independent', 'patch_guided_sad', 'ltp_cli', 'semantic_spatial', or "
-                "'mlp_same_scale'."
+                "'mlp_same_scale', 'spm_ccfm_sad', or 'spm_ccfm_ms_mlp'."
             )
         if self.decoder_variant in {"semantic_spatial", "mlp_same_scale"}:
             if self.layer_mapping is not None:
@@ -1438,7 +1753,19 @@ class DPT(nn.Module):
                 "semantic_spatial expects 0 < spatial_stride < patch_size; "
                 f"got spatial_stride={self.spatial_stride}, patch_size={self.patch_size}"
             )
+        if self.decoder_variant in SPM_CCFM_VARIANTS:
+            if self.layer_mapping is not None:
+                raise ValueError(
+                    f"{self.decoder_variant} uses L12 only and requires layer_mapping=null"
+                )
+            if self.wcf_enabled or adaptive_readout:
+                raise ValueError(f"{self.decoder_variant} cannot combine WCF or ALSR")
         self.in_dims = [self.backbone.embed_dim] * 4
+        self.spm_stem = (
+            LiteSpatialPriorStem(in_channels=3, channels=(32, 64, 128))
+            if self.decoder_variant in SPM_CCFM_VARIANTS
+            else None
+        )
         self.wcf_blocks = nn.ModuleList(
             [
                 L12AnchoredWCF(
@@ -1524,6 +1851,19 @@ class DPT(nn.Module):
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,
                 use_group_norm=not use_bn,
+            )
+        elif self.decoder_variant == "spm_ccfm_sad":
+            self.decoder = SPMCCFMSADDecoder(
+                backbone_channels=self.backbone.embed_dim,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+                use_group_norm=not use_bn,
+            )
+        elif self.decoder_variant == "spm_ccfm_ms_mlp":
+            self.decoder = SPMCCFMMSMLPDecoder(
+                backbone_channels=self.backbone.embed_dim,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
             )
         else:
             self.decoder = SameScaleMLPDecoder(
@@ -1617,7 +1957,28 @@ class DPT(nn.Module):
     def forward(self, x, return_feats=False, return_wcf_gates=False):
         patch_h, patch_w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         patch_embedding = None
-        if self.decoder_variant == "semantic_spatial":
+        wcf_gates = []
+        if self.decoder_variant in SPM_CCFM_VARIANTS:
+            final_layer_idx = self.intermediate_layer_idx[self.encoder_size][-1]
+            if self._backbone_locked:
+                with torch.no_grad():
+                    semantic_features = self.backbone.get_intermediate_layers(
+                        x, n=[final_layer_idx]
+                    )
+            else:
+                semantic_features = self.backbone.get_intermediate_layers(
+                    x, n=[final_layer_idx]
+                )
+            semantic_tokens = semantic_features[-1]
+            spatial_features = self.spm_stem(x)
+            out = self.decoder(
+                semantic_tokens,
+                spatial_features,
+                patch_h,
+                patch_w,
+            )
+            returned_feature = semantic_tokens
+        elif self.decoder_variant == "semantic_spatial":
             final_layer_idx = self.intermediate_layer_idx[self.encoder_size][-1]
             if self._backbone_locked:
                 with torch.no_grad():
@@ -1643,8 +2004,7 @@ class DPT(nn.Module):
             if self.decoder_variant in PATCH_PRIOR_VARIANTS:
                 patch_embedding = self._raw_patch_embedding(x)
 
-        if self.decoder_variant != "semantic_spatial":
-            wcf_gates = []
+        if self.decoder_variant not in (SPM_CCFM_VARIANTS | {"semantic_spatial"}):
             if self.wcf_enabled:
                 anchor = feats[-1]
                 supplemented = []

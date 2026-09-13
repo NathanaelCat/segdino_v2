@@ -1,0 +1,230 @@
+{
+  "preflight": "PASS",
+  "training_started": false,
+  "test_accessed": false,
+  "device": "cuda:0",
+  "results": [
+    {
+      "config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_spm_ccfm_sad_osd_512.json",
+      "model": "DINO-SPM-CCFM-SAD-001",
+      "decoder_variant": "spm_ccfm_sad",
+      "checkpoint_load": null,
+      "dino_source": "Frozen DINOv3-S/16 L12 only",
+      "branch_order": [
+        "D2",
+        "D4",
+        "D8",
+        "D16"
+      ],
+      "semantic_layer_index": 11,
+      "spatial_input_shapes": [
+        [
+          2,
+          32,
+          256,
+          256
+        ],
+        [
+          2,
+          64,
+          128,
+          128
+        ],
+        [
+          2,
+          128,
+          64,
+          64
+        ]
+      ],
+      "l12_tokens_shape": [
+        2,
+        1024,
+        384
+      ],
+      "ccfm_input_shapes": [
+        [
+          2,
+          32,
+          256,
+          256
+        ],
+        [
+          2,
+          64,
+          128,
+          128
+        ],
+        [
+          2,
+          128,
+          64,
+          64
+        ],
+        [
+          2,
+          384,
+          32,
+          32
+        ]
+      ],
+      "ccfm_output_shapes": [
+        [
+          2,
+          256,
+          256,
+          256
+        ],
+        [
+          2,
+          256,
+          128,
+          128
+        ],
+        [
+          2,
+          256,
+          64,
+          64
+        ],
+        [
+          2,
+          256,
+          32,
+          32
+        ]
+      ],
+      "logits_shape": [
+        2,
+        4,
+        512,
+        512
+      ],
+      "backbone_frozen": true,
+      "patch_embed_frozen": true,
+      "tpa_pr_present": false,
+      "sad_blocks": 8,
+      "total_params": 37763244,
+      "backbone_params": 21601152,
+      "non_backbone_params": 16162092,
+      "spm_params": 93472,
+      "decoder_params": 16068620,
+      "ccfm_params": 15520768,
+      "backend_params": 547852,
+      "trainable_params": 16162092,
+      "forward_seconds": 0.429,
+      "peak_allocated_mib": 1660.46
+    },
+    {
+      "config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_spm_ccfm_msmlp_osd_512.json",
+      "model": "DINO-SPM-CCFM-MSMLP-001",
+      "decoder_variant": "spm_ccfm_ms_mlp",
+      "checkpoint_load": null,
+      "dino_source": "Frozen DINOv3-S/16 L12 only",
+      "branch_order": [
+        "D2",
+        "D4",
+        "D8",
+        "D16"
+      ],
+      "semantic_layer_index": 11,
+      "spatial_input_shapes": [
+        [
+          2,
+          32,
+          256,
+          256
+        ],
+        [
+          2,
+          64,
+          128,
+          128
+        ],
+        [
+          2,
+          128,
+          64,
+          64
+        ]
+      ],
+      "l12_tokens_shape": [
+        2,
+        1024,
+        384
+      ],
+      "ccfm_input_shapes": [
+        [
+          2,
+          32,
+          256,
+          256
+        ],
+        [
+          2,
+          64,
+          128,
+          128
+        ],
+        [
+          2,
+          128,
+          64,
+          64
+        ],
+        [
+          2,
+          384,
+          32,
+          32
+        ]
+      ],
+      "ccfm_output_shapes": [
+        [
+          2,
+          256,
+          256,
+          256
+        ],
+        [
+          2,
+          256,
+          128,
+          128
+        ],
+        [
+          2,
+          256,
+          64,
+          64
+        ],
+        [
+          2,
+          256,
+          32,
+          32
+        ]
+      ],
+      "logits_shape": [
+        2,
+        4,
+        512,
+        512
+      ],
+      "backbone_frozen": true,
+      "patch_embed_frozen": true,
+      "tpa_pr_present": false,
+      "sad_blocks": 0,
+      "total_params": 37741988,
+      "backbone_params": 21601152,
+      "non_backbone_params": 16140836,
+      "spm_params": 93472,
+      "decoder_params": 16047364,
+      "ccfm_params": 15520768,
+      "backend_params": 526596,
+      "trainable_params": 16140836,
+      "forward_seconds": 0.081,
+      "peak_allocated_mib": 1885.94
+    }
+  ]
+}
