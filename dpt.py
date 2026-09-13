@@ -10,6 +10,7 @@ PATCH_GUIDED_SAD_VARIANTS = {"patch_guided_sad"}
 PATCH_PRIOR_VARIANTS = PATCH_DPA_VARIANTS | PATCH_GUIDED_SAD_VARIANTS
 LTP_CLI_VARIANTS = {"ltp_cli"}
 SPM_CCFM_VARIANTS = {"spm_ccfm_sad", "spm_ccfm_ms_mlp"}
+SPM_VARIANTS = SPM_CCFM_VARIANTS | {"spm_sad"}
 
 
 class L12AnchoredWCF(nn.Module):
@@ -95,6 +96,68 @@ class ResidualDepthwiseBlock(nn.Module):
     def forward(self, x):
         residual = self.act(self.norm(self.pointwise(self.depthwise(x))))
         return x + self.gamma * residual
+
+
+class MSEFResidualBlock(nn.Module):
+    """OSD adaptation of Multinex's MSEF block.
+
+    The original MSEF core is ``DWConv(LN(x)) * SE(LN(x)) + x``.  For this
+    experiment the core is wrapped by a zero-initialized outer residual
+    coefficient.  The wrapper is intentional: it makes every MSEF location
+    an exact identity at initialization, so replacing the existing zero-gamma
+    SAD-R blocks is a one-variable, parent-equivalent comparison.
+
+    This keeps the paper operation intact: channel-last LayerNorm, depthwise
+    3x3 convolution, and squeeze-excitation with ReLU/tanh.  It does not add
+    pointwise convolution, spatial attention, or a second projection.
+    """
+
+    def __init__(self, channels, reduction_ratio=16):
+        super().__init__()
+        channels = int(channels)
+        reduction_ratio = int(reduction_ratio)
+        if channels <= 0 or reduction_ratio <= 0:
+            raise ValueError("channels and reduction_ratio must be positive")
+        hidden = max(1, channels // reduction_ratio)
+
+        self.channels = channels
+        self.reduction_ratio = reduction_ratio
+        self.layer_norm = nn.LayerNorm(channels)
+        # The public MSEF implementation uses the default bias=True here.
+        self.depthwise_conv = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            groups=channels,
+            bias=True,
+        )
+        self.se_fc1 = nn.Linear(channels, hidden)
+        self.se_fc2 = nn.Linear(hidden, channels)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def _normalized(self, x):
+        # LayerNorm is applied over channels at each spatial position, as in
+        # the reference implementation, without changing the BCHW contract.
+        x = x.permute(0, 2, 3, 1)
+        x = self.layer_norm(x)
+        return x.permute(0, 3, 1, 2)
+
+    def _msef_core(self, x):
+        x_norm = self._normalized(x)
+        depthwise = self.depthwise_conv(x_norm)
+        pooled = F.adaptive_avg_pool2d(x_norm, output_size=1).flatten(1)
+        excitation = F.relu(self.se_fc1(pooled))
+        excitation = torch.tanh(self.se_fc2(excitation)).view(
+            x.shape[0], self.channels, 1, 1
+        )
+        # SEBlock in the reference MSEF returns x_norm * excitation; MSEF
+        # then multiplies that feature tensor with the depthwise branch.
+        se_feature = x_norm * excitation
+        return depthwise * se_feature
+
+    def forward(self, x):
+        return x + self.gamma * self._msef_core(x)
 
 
 class TPAResampleProject(nn.Module):
@@ -300,6 +363,54 @@ class TPASADDecoder(nn.Module):
         x1 = self.sad_inter_1(x1_up + level_1)
 
         return self.out_conv(x1)
+
+
+class TPASADMSEFDecoder(TPASADDecoder):
+    """TPA + SAD with all eight SAD-R locations replaced by MSEF.
+
+    TPA branches, layer routing, feature resolutions, top-down order, and the
+    classifier are inherited unchanged from ``TPASADDecoder``.  Only the four
+    intra-scale and four inter-scale refinement blocks are replaced.
+    """
+
+    def __init__(
+        self,
+        in_dims,
+        decoder_channels=128,
+        num_classes=2,
+        use_group_norm=True,
+        adaptive_readout=False,
+        readout_mode="matrix",
+        readout_init="uniform",
+        readout_temperature=1.0,
+        msef_reduction=16,
+    ):
+        # ``use_group_norm`` is accepted to keep the parent constructor
+        # interface/configuration identical; MSEF uses LayerNorm by design.
+        del use_group_norm
+        super().__init__(
+            in_dims,
+            decoder_channels=decoder_channels,
+            num_classes=num_classes,
+            use_group_norm=True,
+            adaptive_readout=adaptive_readout,
+            readout_mode=readout_mode,
+            readout_init=readout_init,
+            readout_temperature=readout_temperature,
+        )
+
+        msef_blocks = {
+            "sad_intra_1": MSEFResidualBlock(decoder_channels, msef_reduction),
+            "sad_intra_2": MSEFResidualBlock(decoder_channels, msef_reduction),
+            "sad_intra_3": MSEFResidualBlock(decoder_channels, msef_reduction),
+            "sad_intra_4": MSEFResidualBlock(decoder_channels, msef_reduction),
+            "sad_inter_4": MSEFResidualBlock(decoder_channels, msef_reduction),
+            "sad_inter_3": MSEFResidualBlock(decoder_channels, msef_reduction),
+            "sad_inter_2": MSEFResidualBlock(decoder_channels, msef_reduction),
+            "sad_inter_1": MSEFResidualBlock(decoder_channels, msef_reduction),
+        }
+        for name, block in msef_blocks.items():
+            setattr(self, name, block)
 
 
 class SemanticSpatialSADDecoder(nn.Module):
@@ -760,6 +871,100 @@ class SPMCCFMSADDecoder(SPMCCFMDecoderBase):
         level_2 = self.sad_intra_2(p4)
         level_3 = self.sad_intra_3(p8)
         level_4 = self.sad_intra_4(p16)
+        x4 = self.sad_inter_4(level_4)
+        x3 = self.sad_inter_3(
+            F.interpolate(x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False)
+            + level_3
+        )
+        x2 = self.sad_inter_2(
+            F.interpolate(x3, size=level_2.shape[-2:], mode="bilinear", align_corners=False)
+            + level_2
+        )
+        x1 = self.sad_inter_1(
+            F.interpolate(x2, size=level_1.shape[-2:], mode="bilinear", align_corners=False)
+            + level_1
+        )
+        return self.out_conv(x1)
+
+
+class SPMSADDecoder(nn.Module):
+    """Direct Lite-SPM pyramid followed by the original OSD SAD consumer.
+
+    This is the clean CTRL-002 replacement experiment: RGB Lite-SPM supplies
+    P2/P4/P8, the frozen DINOv3 L12 map supplies P16, and those four maps enter
+    the unchanged SAD path directly.  There is deliberately no TPA resample
+    branch and no CCFM between the spatial prior and SAD.
+    """
+
+    def __init__(self, backbone_channels, decoder_channels=128, num_classes=2, use_group_norm=True):
+        super().__init__()
+        self.spatial_projections = nn.ModuleList(
+            [
+                nn.Conv2d(32, decoder_channels, 1, bias=False),
+                nn.Conv2d(64, decoder_channels, 1, bias=False),
+                nn.Conv2d(128, decoder_channels, 1, bias=False),
+            ]
+        )
+        self.semantic_projection = nn.Conv2d(
+            backbone_channels, decoder_channels, 1, bias=False
+        )
+
+        # Keep the SAD blocks identical to the current OSD implementation.
+        self.sad_intra_1 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_intra_2 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_intra_3 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_intra_4 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+
+        self.sad_inter_4 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_inter_3 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_inter_2 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+        self.sad_inter_1 = ResidualDepthwiseBlock(decoder_channels, use_group_norm=use_group_norm)
+
+        self.out_conv = nn.Conv2d(decoder_channels, num_classes, 1)
+
+    @staticmethod
+    def _tokens_to_feature_map(tokens, patch_h, patch_w):
+        if isinstance(tokens, (list, tuple)):
+            tokens = tokens[0]
+        num_patches = patch_h * patch_w
+        if tokens.ndim != 3:
+            raise ValueError(f"Expected token tensor with 3 dims, got shape {tuple(tokens.shape)}")
+        if tokens.shape[1] < num_patches:
+            raise ValueError(
+                f"Token count {tokens.shape[1]} is smaller than expected patch grid {num_patches}"
+            )
+        if tokens.shape[1] != num_patches:
+            tokens = tokens[:, -num_patches:, :]
+        return tokens.transpose(1, 2).reshape(
+            tokens.shape[0], tokens.shape[-1], patch_h, patch_w
+        )
+
+    def forward(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        if len(spatial_features) != 3:
+            raise ValueError(f"SPM/SAD requires D2/D4/D8, got {len(spatial_features)} maps")
+        p2, p4, p8 = [
+            projection(feature)
+            for projection, feature in zip(self.spatial_projections, spatial_features)
+        ]
+        p16 = self.semantic_projection(
+            self._tokens_to_feature_map(semantic_tokens, patch_h, patch_w)
+        )
+
+        expected = (
+            (patch_h * 8, patch_w * 8),
+            (patch_h * 4, patch_w * 4),
+            (patch_h * 2, patch_w * 2),
+            (patch_h, patch_w),
+        )
+        actual = tuple(feature.shape[-2:] for feature in (p2, p4, p8, p16))
+        if actual != expected:
+            raise RuntimeError(f"SPM/SAD input shape mismatch: got {actual}, expected {expected}")
+
+        level_1 = self.sad_intra_1(p2)
+        level_2 = self.sad_intra_2(p4)
+        level_3 = self.sad_intra_3(p8)
+        level_4 = self.sad_intra_4(p16)
+
         x4 = self.sad_inter_4(level_4)
         x3 = self.sad_inter_3(
             F.interpolate(x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False)
@@ -1674,6 +1879,7 @@ class DPT(nn.Module):
         self.spatial_stride = int(spatial_stride)
         if self.decoder_variant not in {
             "tpa_sad",
+            "tpa_sad_msef",
             "tpa_ms_mlp",
             "tpa_change_cascade",
             "dpa_ms_mlp",
@@ -1687,14 +1893,15 @@ class DPT(nn.Module):
             "mlp_same_scale",
             "spm_ccfm_sad",
             "spm_ccfm_ms_mlp",
+            "spm_sad",
         }:
             raise ValueError(
                 f"Unknown decoder_variant '{self.decoder_variant}'. "
-                "Expected 'tpa_sad', 'tpa_ms_mlp', 'dpa_ms_mlp', "
+                "Expected 'tpa_sad', 'tpa_sad_msef', 'tpa_ms_mlp', 'dpa_ms_mlp', "
                 "'tpa_change_cascade', "
                 "'tpa_sad_base', 'dpa_sad_base', 'patch_dpa_shared', "
                 "'patch_dpa_independent', 'patch_guided_sad', 'ltp_cli', 'semantic_spatial', or "
-                "'mlp_same_scale', 'spm_ccfm_sad', or 'spm_ccfm_ms_mlp'."
+                "'mlp_same_scale', 'spm_ccfm_sad', 'spm_ccfm_ms_mlp', or 'spm_sad'."
             )
         if self.decoder_variant in {"semantic_spatial", "mlp_same_scale"}:
             if self.layer_mapping is not None:
@@ -1753,7 +1960,7 @@ class DPT(nn.Module):
                 "semantic_spatial expects 0 < spatial_stride < patch_size; "
                 f"got spatial_stride={self.spatial_stride}, patch_size={self.patch_size}"
             )
-        if self.decoder_variant in SPM_CCFM_VARIANTS:
+        if self.decoder_variant in SPM_VARIANTS:
             if self.layer_mapping is not None:
                 raise ValueError(
                     f"{self.decoder_variant} uses L12 only and requires layer_mapping=null"
@@ -1763,7 +1970,7 @@ class DPT(nn.Module):
         self.in_dims = [self.backbone.embed_dim] * 4
         self.spm_stem = (
             LiteSpatialPriorStem(in_channels=3, channels=(32, 64, 128))
-            if self.decoder_variant in SPM_CCFM_VARIANTS
+            if self.decoder_variant in SPM_VARIANTS
             else None
         )
         self.wcf_blocks = nn.ModuleList(
@@ -1788,6 +1995,18 @@ class DPT(nn.Module):
                 readout_mode=readout_mode,
                 readout_init=readout_init,
                 readout_temperature=readout_temperature,
+            )
+        elif self.decoder_variant == "tpa_sad_msef":
+            self.decoder = TPASADMSEFDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+                use_group_norm=not use_bn,
+                adaptive_readout=adaptive_readout,
+                readout_mode=readout_mode,
+                readout_init=readout_init,
+                readout_temperature=readout_temperature,
+                msef_reduction=16,
             )
         elif self.decoder_variant == "tpa_ms_mlp":
             self.decoder = TPAMultiScaleMLPDecoder(
@@ -1864,6 +2083,13 @@ class DPT(nn.Module):
                 backbone_channels=self.backbone.embed_dim,
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "spm_sad":
+            self.decoder = SPMSADDecoder(
+                backbone_channels=self.backbone.embed_dim,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+                use_group_norm=not use_bn,
             )
         else:
             self.decoder = SameScaleMLPDecoder(
@@ -1958,7 +2184,7 @@ class DPT(nn.Module):
         patch_h, patch_w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         patch_embedding = None
         wcf_gates = []
-        if self.decoder_variant in SPM_CCFM_VARIANTS:
+        if self.decoder_variant in SPM_VARIANTS:
             final_layer_idx = self.intermediate_layer_idx[self.encoder_size][-1]
             if self._backbone_locked:
                 with torch.no_grad():
@@ -2004,7 +2230,7 @@ class DPT(nn.Module):
             if self.decoder_variant in PATCH_PRIOR_VARIANTS:
                 patch_embedding = self._raw_patch_embedding(x)
 
-        if self.decoder_variant not in (SPM_CCFM_VARIANTS | {"semantic_spatial"}):
+        if self.decoder_variant not in (SPM_VARIANTS | {"semantic_spatial"}):
             if self.wcf_enabled:
                 anchor = feats[-1]
                 supplemented = []

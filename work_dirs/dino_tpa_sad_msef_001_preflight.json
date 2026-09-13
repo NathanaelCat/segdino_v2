@@ -1,0 +1,247 @@
+{
+  "status": "PASS",
+  "candidate": "DINO-TPA-SAD-MSEF-001_l12x4",
+  "parent": "DINO-LAYER-CTRL-002_l12x4",
+  "device": "cuda:0",
+  "input_shape": [
+    1,
+    3,
+    512,
+    512
+  ],
+  "feature_shapes_before_decoder": [
+    [
+      1,
+      1024,
+      384
+    ],
+    [
+      1,
+      1024,
+      384
+    ],
+    [
+      1,
+      1024,
+      384
+    ],
+    [
+      1,
+      1024,
+      384
+    ]
+  ],
+  "routing": [
+    3,
+    3,
+    3,
+    3
+  ],
+  "backbone_frozen": true,
+  "patch_embed_frozen": true,
+  "parent_decoder_variant": "tpa_sad",
+  "candidate_decoder_variant": "tpa_sad_msef",
+  "parent_ordinary_sad_r_blocks": 8,
+  "candidate_ordinary_sad_r_blocks": 0,
+  "candidate_msef_blocks": 8,
+  "msef_reduction_ratio": 16,
+  "common_state_keys_copied": 206,
+  "candidate_new_state_key_count": 64,
+  "candidate_new_state_prefixes": [
+    "sad_inter_1",
+    "sad_inter_2",
+    "sad_inter_3",
+    "sad_inter_4",
+    "sad_intra_1",
+    "sad_intra_2",
+    "sad_intra_3",
+    "sad_intra_4"
+  ],
+  "tpa_branch_shapes_parent": {
+    "tpa_branch_1": [
+      1,
+      256,
+      256,
+      256
+    ],
+    "tpa_branch_2": [
+      1,
+      256,
+      128,
+      128
+    ],
+    "tpa_branch_3": [
+      1,
+      256,
+      64,
+      64
+    ],
+    "tpa_branch_4": [
+      1,
+      256,
+      32,
+      32
+    ]
+  },
+  "tpa_branch_shapes_candidate": {
+    "tpa_branch_1": [
+      1,
+      256,
+      256,
+      256
+    ],
+    "tpa_branch_2": [
+      1,
+      256,
+      128,
+      128
+    ],
+    "tpa_branch_3": [
+      1,
+      256,
+      64,
+      64
+    ],
+    "tpa_branch_4": [
+      1,
+      256,
+      32,
+      32
+    ]
+  },
+  "logits_shape": [
+    1,
+    4,
+    512,
+    512
+  ],
+  "gamma_zero_parent_logits_max_abs_diff": 0.0,
+  "gamma_zero_grad_norms": {
+    "gamma_1": 0.03342437744140625,
+    "gamma_2": 0.017373068258166313,
+    "gamma_3": 0.005087960045784712,
+    "gamma_4": 0.013866862282156944,
+    "gamma_5": 0.045125097036361694,
+    "gamma_6": 0.039251767098903656,
+    "gamma_7": 0.012884036637842655,
+    "gamma_8": 0.008275719359517097
+  },
+  "gamma_zero_msef_core_max_grad_norm": 0.0,
+  "gamma_1e-3_msef_core_grad_norms": {
+    "block_1": 0.0008083900320343673,
+    "block_2": 0.000200652502826415,
+    "block_3": 0.00041001677163876593,
+    "block_4": 0.0004170537868048996,
+    "block_5": 0.0004509602440521121,
+    "block_6": 0.0004373612755443901,
+    "block_7": 0.0004088708956260234,
+    "block_8": 0.0004598288796842098
+  },
+  "params": {
+    "parent_total": 24901516,
+    "candidate_total": 24446988,
+    "parent_trainable": 3300364,
+    "candidate_trainable": 2845836,
+    "trainable_delta": -454528,
+    "ordinary_r_params_removed": 546824,
+    "msef_params_added": 92296,
+    "expected_msef_params_added": 92296
+  },
+  "optimizer": {
+    "name": "AdamW",
+    "lr": 0.0001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "weight_decay": 0.0001,
+    "parameter_count": 82,
+    "parameter_numel": 2845836,
+    "parameter_names": [
+      "decoder.token_projections.0.weight",
+      "decoder.token_projections.1.weight",
+      "decoder.token_projections.2.weight",
+      "decoder.token_projections.3.weight",
+      "decoder.tpa_branch_1.conv.weight",
+      "decoder.tpa_branch_2.conv.weight",
+      "decoder.tpa_branch_3.conv.weight",
+      "decoder.tpa_branch_4.conv.weight",
+      "decoder.sad_intra_1.gamma",
+      "decoder.sad_intra_1.layer_norm.weight",
+      "decoder.sad_intra_1.layer_norm.bias",
+      "decoder.sad_intra_1.depthwise_conv.weight",
+      "decoder.sad_intra_1.depthwise_conv.bias",
+      "decoder.sad_intra_1.se_fc1.weight",
+      "decoder.sad_intra_1.se_fc1.bias",
+      "decoder.sad_intra_1.se_fc2.weight",
+      "decoder.sad_intra_1.se_fc2.bias",
+      "decoder.sad_intra_2.gamma",
+      "decoder.sad_intra_2.layer_norm.weight",
+      "decoder.sad_intra_2.layer_norm.bias",
+      "decoder.sad_intra_2.depthwise_conv.weight",
+      "decoder.sad_intra_2.depthwise_conv.bias",
+      "decoder.sad_intra_2.se_fc1.weight",
+      "decoder.sad_intra_2.se_fc1.bias",
+      "decoder.sad_intra_2.se_fc2.weight",
+      "decoder.sad_intra_2.se_fc2.bias",
+      "decoder.sad_intra_3.gamma",
+      "decoder.sad_intra_3.layer_norm.weight",
+      "decoder.sad_intra_3.layer_norm.bias",
+      "decoder.sad_intra_3.depthwise_conv.weight",
+      "decoder.sad_intra_3.depthwise_conv.bias",
+      "decoder.sad_intra_3.se_fc1.weight",
+      "decoder.sad_intra_3.se_fc1.bias",
+      "decoder.sad_intra_3.se_fc2.weight",
+      "decoder.sad_intra_3.se_fc2.bias",
+      "decoder.sad_intra_4.gamma",
+      "decoder.sad_intra_4.layer_norm.weight",
+      "decoder.sad_intra_4.layer_norm.bias",
+      "decoder.sad_intra_4.depthwise_conv.weight",
+      "decoder.sad_intra_4.depthwise_conv.bias",
+      "decoder.sad_intra_4.se_fc1.weight",
+      "decoder.sad_intra_4.se_fc1.bias",
+      "decoder.sad_intra_4.se_fc2.weight",
+      "decoder.sad_intra_4.se_fc2.bias",
+      "decoder.sad_inter_4.gamma",
+      "decoder.sad_inter_4.layer_norm.weight",
+      "decoder.sad_inter_4.layer_norm.bias",
+      "decoder.sad_inter_4.depthwise_conv.weight",
+      "decoder.sad_inter_4.depthwise_conv.bias",
+      "decoder.sad_inter_4.se_fc1.weight",
+      "decoder.sad_inter_4.se_fc1.bias",
+      "decoder.sad_inter_4.se_fc2.weight",
+      "decoder.sad_inter_4.se_fc2.bias",
+      "decoder.sad_inter_3.gamma",
+      "decoder.sad_inter_3.layer_norm.weight",
+      "decoder.sad_inter_3.layer_norm.bias",
+      "decoder.sad_inter_3.depthwise_conv.weight",
+      "decoder.sad_inter_3.depthwise_conv.bias",
+      "decoder.sad_inter_3.se_fc1.weight",
+      "decoder.sad_inter_3.se_fc1.bias",
+      "decoder.sad_inter_3.se_fc2.weight",
+      "decoder.sad_inter_3.se_fc2.bias",
+      "decoder.sad_inter_2.gamma",
+      "decoder.sad_inter_2.layer_norm.weight",
+      "decoder.sad_inter_2.layer_norm.bias",
+      "decoder.sad_inter_2.depthwise_conv.weight",
+      "decoder.sad_inter_2.depthwise_conv.bias",
+      "decoder.sad_inter_2.se_fc1.weight",
+      "decoder.sad_inter_2.se_fc1.bias",
+      "decoder.sad_inter_2.se_fc2.weight",
+      "decoder.sad_inter_2.se_fc2.bias",
+      "decoder.sad_inter_1.gamma",
+      "decoder.sad_inter_1.layer_norm.weight",
+      "decoder.sad_inter_1.layer_norm.bias",
+      "decoder.sad_inter_1.depthwise_conv.weight",
+      "decoder.sad_inter_1.depthwise_conv.bias",
+      "decoder.sad_inter_1.se_fc1.weight",
+      "decoder.sad_inter_1.se_fc1.bias",
+      "decoder.sad_inter_1.se_fc2.weight",
+      "decoder.sad_inter_1.se_fc2.bias",
+      "decoder.out_conv.weight",
+      "decoder.out_conv.bias"
+    ]
+  },
+  "peak_memory_allocated_mib": 1804.42529296875,
+  "protocol_diff": "only model.decoder_variant changes; name/run_dir/device are metadata/runtime overrides"
+}

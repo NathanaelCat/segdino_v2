@@ -604,6 +604,13 @@ def run(
             f"decoder_variant={model_cfg.decoder_variant} "
             f"spatial_stride={model_cfg.spatial_stride}"
         )
+    elif model_cfg.decoder_variant == "tpa_sad_msef":
+        log_print(
+            "decoder_variant=tpa_sad_msef; TPA produces "
+            "256/128/64/32 branches; all eight SAD-R locations use the "
+            "MSEF core (LayerNorm + depthwise 3x3 + SE), wrapped by "
+            "zero-initialized residual gamma; reduction=16"
+        )
     elif model_cfg.decoder_variant == "mlp_same_scale":
         log_print(
             "decoder_variant=mlp_same_scale; four native [L3,L6,L9,L12] "
