@@ -135,6 +135,58 @@ def _summarize_patch_dpa_trace(model: nn.Module, trace: dict[str, Any]) -> dict[
     }
 
 
+def _summarize_patch_sad_trace(model: nn.Module, trace: dict[str, Any]) -> dict[str, Any]:
+    """Summarize the four scale-aligned PatchGuidedR SAD stages."""
+    decoder = getattr(model, "decoder", None)
+    if decoder is None or not hasattr(decoder, "named_patch_blocks"):
+        raise RuntimeError("Patch-guided SAD diagnostics require named patch blocks")
+    names = ("P16", "P8", "P4", "P2")
+    scores = trace.get("scores")
+    features = trace.get("projected")
+    residuals = trace.get("residuals")
+    if any(
+        values is None or len(values) != len(names)
+        for values in (scores, features, residuals)
+    ):
+        raise RuntimeError(
+            "Patch-guided SAD diagnostics must return four scale scores, inputs, "
+            "and residuals"
+        )
+
+    def spatial_stats(value: torch.Tensor) -> dict[str, float]:
+        value = value.detach().float()
+        return {
+            "mean": float(value.mean().item()),
+            "std": float(value.std(unbiased=False).item()),
+            "min": float(value.min().item()),
+            "max": float(value.max().item()),
+        }
+
+    residual_ratios = {}
+    for name, feature, residual in zip(names, features, residuals):
+        feature_flat = feature.detach().float().flatten(1)
+        residual_flat = residual.detach().float().flatten(1)
+        ratio = residual_flat.norm(dim=1) / feature_flat.norm(dim=1).clamp_min(1e-12)
+        residual_ratios[f"R_{name}"] = spatial_stats(ratio)
+    return {
+        "alpha": {
+            name: float(module.alpha.detach().float().item())
+            for name, module in decoder.named_patch_blocks()
+        },
+        "scores": {
+            f"S_{name}": spatial_stats(value)
+            for name, value in zip(names, scores)
+        },
+        "cosines": {
+            f"cos_{name}": spatial_stats(value)
+            for name, value in zip(names, trace["cosines"])
+        },
+        "residual_ratios": residual_ratios,
+        "native_patch_shape": list(trace["native_patch"].shape),
+        "patch_pyramid_shapes": [list(value.shape) for value in trace["patch_priors"]],
+    }
+
+
 def _seed_everything(seed: int, deterministic: bool, cudnn_benchmark: bool) -> None:
     if deterministic and cudnn_benchmark:
         raise ValueError("deterministic=True and cudnn_benchmark=True are contradictory")
@@ -213,6 +265,8 @@ def evaluate(
             logits, trace = diagnostics_fn(inputs_device)
             if model.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}:
                 dpa_stats = _summarize_patch_dpa_trace(model, trace)
+            elif model.decoder_variant == "patch_guided_sad":
+                dpa_stats = _summarize_patch_sad_trace(model, trace)
             else:
                 dpa_stats = _summarize_dpa_trace(model, trace)
         else:
@@ -305,6 +359,34 @@ def _load_init_checkpoint(model: nn.Module, path: Path) -> dict[str, Any]:
         if missing_set not in (expected_missing, set()) or unexpected:
             raise RuntimeError(
                 "Patch-DPA initialization checkpoint alignment mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+    elif variant == "patch_guided_sad":
+        expected_missing = {
+            name
+            for name in model.state_dict()
+            if name.startswith("decoder.patch_")
+        }
+        missing_set = set(missing)
+        if missing_set not in (expected_missing, set()) or unexpected:
+            raise RuntimeError(
+                "Patch-guided SAD initialization checkpoint alignment mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
+    elif variant == "tpa_sad":
+        # B3R0 is initialized from the shared PR/SAD-Base state.  The ordinary
+        # SAD R blocks are new, but all have gamma=0, so the active initial
+        # function remains exactly the same as the neutral parent.
+        expected_missing = {
+            name
+            for name in model.state_dict()
+            if name.startswith("decoder.sad_intra_")
+            or name.startswith("decoder.sad_inter_")
+        }
+        missing_set = set(missing)
+        if missing_set not in (expected_missing, set()) or unexpected:
+            raise RuntimeError(
+                "SAD-R initialization checkpoint alignment mismatch: "
                 f"missing={missing}, unexpected={unexpected}"
             )
     elif missing or unexpected:
@@ -535,6 +617,18 @@ def run(
             "before TPA reconstruction; SAD-Base is progressive upsample+add "
             "only; no SAD refinement blocks"
         )
+    elif model_cfg.decoder_variant == "patch_guided_sad":
+        log_print(
+            f"decoder_variant=patch_guided_sad; PR produces 256/128/64/32 branches; "
+            f"raw K16/S{model_cfg.spatial_stride} patch prior is aligned to each scale; "
+            "all eight SAD R locations are replaced by PatchGuidedR"
+        )
+    elif model_cfg.decoder_variant == "ltp_cli":
+        log_print(
+            "decoder_variant=ltp_cli; B1 PR+MS-MLP path is unchanged; "
+            "RGB LTP produces S4/S8/S16 memory [16384+4096+1024,64]; "
+            "four DINO levels read it with shared-K/V ReLU linear cross interaction"
+        )
 
     epochs = training.get("epochs")
     max_iters = training.get("max_iters")
@@ -639,6 +733,7 @@ def run(
                 "dpa_sad_base",
                 "patch_dpa_shared",
                 "patch_dpa_independent",
+                "patch_guided_sad",
             }
             evaluation = evaluate(
                 model,
@@ -760,6 +855,7 @@ def run(
         "dpa_sad_base",
         "patch_dpa_shared",
         "patch_dpa_independent",
+        "patch_guided_sad",
     } and history:
         summary["dpa_diagnostics_last"] = history[-1].get("dpa_stats")
         summary["dpa_diagnostics_best"] = best_dpa_stats

@@ -2,6 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ltp_cli import CrossLinearInteraction, LightweightTokenPyramid
+
+
+PATCH_DPA_VARIANTS = {"patch_dpa_shared", "patch_dpa_independent"}
+PATCH_GUIDED_SAD_VARIANTS = {"patch_guided_sad"}
+PATCH_PRIOR_VARIANTS = PATCH_DPA_VARIANTS | PATCH_GUIDED_SAD_VARIANTS
+LTP_CLI_VARIANTS = {"ltp_cli"}
+
 
 class L12AnchoredWCF(nn.Module):
     """L12-anchored token/channel selective shallow supplementation.
@@ -539,6 +547,70 @@ class TPAMultiScaleMLPDecoder(nn.Module):
         )
 
 
+class LTPCLIMultiScaleMLPDecoder(TPAMultiScaleMLPDecoder):
+    """B1 plus an RGB token pyramid and cross-linear interaction.
+
+    ``TPAMultiScaleMLPDecoder`` is initialized first and inherited unchanged:
+    its token projections, PR branches, and MS-MLP are the complete B1 path.
+    The new LTP/CLI path is inserted between B1 token projection and B1 PR.
+    With all CLI ``gamma`` values at zero, the output is therefore exactly the
+    B1 output for the same shared weights and input.
+    """
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(
+            in_dims,
+            decoder_channels=decoder_channels,
+            num_classes=num_classes,
+        )
+        if decoder_channels != 256:
+            raise ValueError(
+                "DINO-LTP-CLI-001 fixes the B1 decoder width and CLI query width at 256; "
+                f"got decoder_channels={decoder_channels}"
+            )
+        self.ltp = LightweightTokenPyramid(
+            s4_channels=64,
+            s8_channels=96,
+            s16_channels=128,
+            memory_channels=64,
+            num_heads=4,
+        )
+        self.cli = CrossLinearInteraction(
+            query_channels=decoder_channels,
+            memory_channels=64,
+            interaction_channels=64,
+            num_heads=4,
+            num_queries=4,
+        )
+
+    def _forward_impl(self, features, patch_h, patch_w, image, diagnostics=False):
+        if image is None:
+            raise ValueError("DINO-LTP-CLI requires the original RGB image")
+        projected = self._project_tokens(features, patch_h, patch_w)
+        memory, ltp_trace = self.ltp(image, return_trace=True)
+        calibrated, cli_trace = self.cli(projected, memory, return_trace=True)
+        pyramid = self._build_tpa_pyramid(calibrated)
+        logits = self.ms_mlp(pyramid)
+        if not diagnostics:
+            return logits
+        return logits, {
+            "projected": tuple(projected),
+            "calibrated": tuple(calibrated),
+            "pyramid": tuple(pyramid),
+            "s4": ltp_trace["s4"],
+            "s8": ltp_trace["s8"],
+            "s16": ltp_trace["s16"],
+            "memory": memory,
+            "interaction_outputs": cli_trace["interaction_outputs"],
+        }
+
+    def forward(self, features, patch_h, patch_w, image=None):
+        return self._forward_impl(features, patch_h, patch_w, image, diagnostics=False)
+
+    def forward_with_diagnostics(self, features, patch_h, patch_w, image=None):
+        return self._forward_impl(features, patch_h, patch_w, image, diagnostics=True)
+
+
 class DPAMultiScaleMLPDecoder(TPAMultiScaleMLPDecoder):
     """DPA inserted between TPA token projection and spatial reconstruction.
 
@@ -692,7 +764,7 @@ class PatchGuidedDPADecoder(TPAMultiScaleMLPDecoder):
     def alphas(self):
         return (self.alpha_3, self.alpha_6, self.alpha_9, self.alpha_12)
 
-    def _patch_aligned_features(self, patch_embedding):
+    def _patch_aligned_features(self, patch_embedding, target_size):
         if patch_embedding.ndim != 4:
             raise ValueError(
                 "Patch-guided DPA requires raw patch embedding [B,384,H,W], got "
@@ -703,15 +775,31 @@ class PatchGuidedDPADecoder(TPAMultiScaleMLPDecoder):
             priors = [shared_prior] * 4
         else:
             priors = [adapter(patch_embedding) for adapter in self.patch_adapters]
-        aligned = [projection(prior) for projection, prior in zip(self.depth_alignments, priors)]
-        return priors, aligned
+        # B2PS-S4/B2PI-S4 are deliberately a control: the S4 prior is first
+        # reduced to the DINO token grid before the original 32x32 DPA is
+        # evaluated.  The native prior is retained in the trace so that the
+        # information bottleneck is explicit in the experiment record.
+        aligned_priors = [
+            prior
+            if prior.shape[-2:] == target_size
+            else F.interpolate(prior, size=target_size, mode="bilinear", align_corners=False)
+            for prior in priors
+        ]
+        aligned = [
+            projection(prior)
+            for projection, prior in zip(self.depth_alignments, aligned_priors)
+        ]
+        return priors, aligned_priors, aligned
 
     def _calibrate_projected(self, projected, patch_embedding):
         if len(projected) != 4:
             raise ValueError(
                 f"Patch-guided DPA requires four projected maps, got {len(projected)}"
             )
-        priors, aligned = self._patch_aligned_features(patch_embedding)
+        target_size = projected[0].shape[-2:]
+        priors, aligned_priors, aligned = self._patch_aligned_features(
+            patch_embedding, target_size
+        )
         calibrated = []
         scores = []
         cosines = []
@@ -724,13 +812,13 @@ class PatchGuidedDPADecoder(TPAMultiScaleMLPDecoder):
             scores.append(score)
             cosines.append(cosine)
             residuals.append(residual)
-        return calibrated, priors, aligned, scores, cosines, residuals
+        return calibrated, priors, aligned_priors, aligned, scores, cosines, residuals
 
     def forward(self, features, patch_h, patch_w, patch_embedding=None):
         if patch_embedding is None:
             raise ValueError("Patch-guided DPA requires raw patch embedding input")
         projected = self._project_tokens(features, patch_h, patch_w)
-        calibrated, _, _, _, _, _ = self._calibrate_projected(
+        calibrated, _, _, _, _, _, _ = self._calibrate_projected(
             projected, patch_embedding
         )
         pyramid = self._build_tpa_pyramid(calibrated)
@@ -740,7 +828,7 @@ class PatchGuidedDPADecoder(TPAMultiScaleMLPDecoder):
         if patch_embedding is None:
             raise ValueError("Patch-guided DPA requires raw patch embedding input")
         projected = self._project_tokens(features, patch_h, patch_w)
-        calibrated, priors, aligned, scores, cosines, residuals = self._calibrate_projected(
+        calibrated, priors, aligned_priors, aligned, scores, cosines, residuals = self._calibrate_projected(
             projected, patch_embedding
         )
         pyramid = self._build_tpa_pyramid(calibrated)
@@ -749,12 +837,244 @@ class PatchGuidedDPADecoder(TPAMultiScaleMLPDecoder):
             "projected": tuple(projected),
             "calibrated": tuple(calibrated),
             "patch_priors": tuple(priors),
+            "resized_patch_priors": tuple(aligned_priors),
             "aligned_patch_priors": tuple(aligned),
             "scores": tuple(scores),
             "cosines": tuple(cosines),
             "residuals": tuple(residuals),
             "pyramid": tuple(pyramid),
         }
+
+
+class PatchGuidedResidualBlock(nn.Module):
+    """Replace one SAD residual block with patch-guided signed calibration.
+
+    The block deliberately has no normalization, activation, depthwise
+    refinement, or attention.  It uses the same cosine-gated residual idea as
+    the validated patch-DPA path, but consumes a patch prior already aligned
+    to the current SAD scale.  With ``alpha=0`` it is an exact identity.
+    """
+
+    def __init__(self, channels, alpha_init=0.0):
+        super().__init__()
+        self.phi = nn.Conv2d(channels, channels, 1, bias=False)
+        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+
+    def forward(self, x, patch, return_trace=False):
+        if x.ndim != 4 or patch.ndim != 4:
+            raise ValueError(
+                "PatchGuidedResidualBlock expects feature and patch maps [B,C,H,W], "
+                f"got {tuple(x.shape)} and {tuple(patch.shape)}"
+            )
+        if x.shape != patch.shape:
+            raise ValueError(
+                "PatchGuidedResidualBlock requires exact feature/patch alignment, "
+                f"got {tuple(x.shape)} and {tuple(patch.shape)}"
+            )
+        q = self.phi(patch)
+        cosine = F.cosine_similarity(x, q, dim=1, eps=1e-6)
+        score = ((cosine + 1.0) * 0.5).unsqueeze(1)
+        residual = self.alpha * score * q
+        output = x + residual
+        if return_trace:
+            return output, {
+                "aligned_patch": patch,
+                "q": q,
+                "score": score,
+                "cosine": cosine,
+                "residual": residual,
+                "input": x,
+            }
+        return output
+
+
+class PatchGuidedSADDecoder(nn.Module):
+    """TPA PR followed by SAD with every R replaced by PatchGuidedR.
+
+    The four TPA branches are copied from the current OSD PR exactly.  A raw
+    frozen K16 patch projection is adapted once at its native grid, then
+    aligned independently to P2/P4/P8/P16.  Both the four intra-scale and
+    four top-down SAD R locations consume the patch prior at their own scale;
+    no S4 prior is first collapsed to 32x32 in this decoder.
+    """
+
+    SCALE_NAMES = ("P16", "P8", "P4", "P2")
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__()
+        if len(in_dims) != 4 or len(set(in_dims)) != 1:
+            raise ValueError(
+                f"PatchGuidedSADDecoder requires four equal input dims, got {in_dims}"
+            )
+        self.in_dims = list(in_dims)
+        self.decoder_channels = int(decoder_channels)
+        self.token_projections = nn.ModuleList(
+            [nn.Conv2d(channels, decoder_channels, 1, bias=False) for channels in in_dims]
+        )
+        self.tpa_branch_1 = TPAResampleProject(decoder_channels, scale_factor=8)
+        self.tpa_branch_2 = TPAResampleProject(decoder_channels, scale_factor=4)
+        self.tpa_branch_3 = TPAResampleProject(decoder_channels, scale_factor=2)
+        self.tpa_branch_4 = TPAResampleProject(decoder_channels, scale_factor=1)
+
+        # One shared local adapter keeps the patch source definition fixed;
+        # scale-specific 1x1 alignments provide independent latent spaces.
+        self.patch_adapter = PatchAdapter(
+            in_channels=in_dims[0], out_channels=decoder_channels
+        )
+        self.patch_scale_align = nn.ModuleDict(
+            {
+                name: nn.Conv2d(decoder_channels, decoder_channels, 1, bias=False)
+                for name in ("P2", "P4", "P8", "P16")
+            }
+        )
+
+        # These eight modules occupy exactly the former SAD intra/inter R
+        # locations.  They are identities at initialization and contain no
+        # ordinary SAD refinement path.
+        self.patch_intra_p2 = PatchGuidedResidualBlock(decoder_channels)
+        self.patch_intra_p4 = PatchGuidedResidualBlock(decoder_channels)
+        self.patch_intra_p8 = PatchGuidedResidualBlock(decoder_channels)
+        self.patch_intra_p16 = PatchGuidedResidualBlock(decoder_channels)
+        self.patch_inter_p16 = PatchGuidedResidualBlock(decoder_channels)
+        self.patch_inter_p8 = PatchGuidedResidualBlock(decoder_channels)
+        self.patch_inter_p4 = PatchGuidedResidualBlock(decoder_channels)
+        self.patch_inter_p2 = PatchGuidedResidualBlock(decoder_channels)
+
+        self.out_conv = nn.Conv2d(decoder_channels, num_classes, 1)
+
+    @staticmethod
+    def _tokens_to_feature_map(x, patch_h, patch_w):
+        if isinstance(x, (list, tuple)):
+            x = x[0]
+        num_patches = patch_h * patch_w
+        if x.ndim != 3:
+            raise ValueError(f"Expected token tensor with 3 dims, got shape {tuple(x.shape)}")
+        if x.shape[1] < num_patches:
+            raise ValueError(
+                f"Token count {x.shape[1]} is smaller than expected patch grid {num_patches}"
+            )
+        if x.shape[1] != num_patches:
+            x = x[:, -num_patches:, :]
+        return x.transpose(1, 2).reshape(x.shape[0], x.shape[-1], patch_h, patch_w)
+
+    def _project_tokens(self, features, patch_h, patch_w):
+        if len(features) != 4:
+            raise ValueError(f"PatchGuidedSADDecoder requires four features, got {len(features)}")
+        return [
+            projection(self._tokens_to_feature_map(tokens, patch_h, patch_w))
+            for projection, tokens in zip(self.token_projections, features)
+        ]
+
+    def _build_tpa_pyramid(self, projected):
+        if len(projected) != 4:
+            raise ValueError(f"TPA pyramid requires four projected maps, got {len(projected)}")
+        return (
+            self.tpa_branch_1(projected[0]),
+            self.tpa_branch_2(projected[1]),
+            self.tpa_branch_3(projected[2]),
+            self.tpa_branch_4(projected[3]),
+        )
+
+    def _build_patch_pyramid(self, raw_patch, patch_h, patch_w):
+        if raw_patch.ndim != 4:
+            raise ValueError(
+                "PatchGuidedSADDecoder requires raw patch map [B,C,H,W], got "
+                f"{tuple(raw_patch.shape)}"
+            )
+        native = self.patch_adapter(raw_patch)
+        sizes = {
+            "P2": (patch_h * 8, patch_w * 8),
+            "P4": (patch_h * 4, patch_w * 4),
+            "P8": (patch_h * 2, patch_w * 2),
+            "P16": (patch_h, patch_w),
+        }
+        pyramid = {}
+        for name, size in sizes.items():
+            aligned = native
+            if aligned.shape[-2:] != size:
+                aligned = F.interpolate(
+                    aligned, size=size, mode="bilinear", align_corners=False
+                )
+            pyramid[name] = self.patch_scale_align[name](aligned)
+        return pyramid, native
+
+    @property
+    def alphas(self):
+        return tuple(module.alpha for _, module in self.named_patch_blocks())
+
+    def named_patch_blocks(self):
+        return (
+            ("alpha_intra_P2", self.patch_intra_p2),
+            ("alpha_intra_P4", self.patch_intra_p4),
+            ("alpha_intra_P8", self.patch_intra_p8),
+            ("alpha_intra_P16", self.patch_intra_p16),
+            ("alpha_inter_P16", self.patch_inter_p16),
+            ("alpha_inter_P8", self.patch_inter_p8),
+            ("alpha_inter_P4", self.patch_inter_p4),
+            ("alpha_inter_P2", self.patch_inter_p2),
+        )
+
+    def _forward_impl(self, features, raw_patch, patch_h, patch_w, diagnostics=False):
+        projected = self._project_tokens(features, patch_h, patch_w)
+        pyramid = self._build_tpa_pyramid(projected)
+        patch_pyramid, native_patch = self._build_patch_pyramid(
+            raw_patch, patch_h, patch_w
+        )
+        p2, p4, p8, p16 = pyramid
+        q2, q4, q8, q16 = (
+            patch_pyramid["P2"],
+            patch_pyramid["P4"],
+            patch_pyramid["P8"],
+            patch_pyramid["P16"],
+        )
+
+        level2, intra2 = self.patch_intra_p2(p2, q2, return_trace=True)
+        level4, intra4 = self.patch_intra_p4(p4, q4, return_trace=True)
+        level8, intra8 = self.patch_intra_p8(p8, q8, return_trace=True)
+        level16, intra16 = self.patch_intra_p16(p16, q16, return_trace=True)
+
+        x16, inter16 = self.patch_inter_p16(level16, q16, return_trace=True)
+        x8_input = F.interpolate(
+            x16, size=level8.shape[-2:], mode="bilinear", align_corners=False
+        ) + level8
+        x8, inter8 = self.patch_inter_p8(x8_input, q8, return_trace=True)
+        x4_input = F.interpolate(
+            x8, size=level4.shape[-2:], mode="bilinear", align_corners=False
+        ) + level4
+        x4, inter4 = self.patch_inter_p4(x4_input, q4, return_trace=True)
+        x2_input = F.interpolate(
+            x4, size=level2.shape[-2:], mode="bilinear", align_corners=False
+        ) + level2
+        x2, inter2 = self.patch_inter_p2(x2_input, q2, return_trace=True)
+        logits = self.out_conv(x2)
+        if not diagnostics:
+            return logits
+
+        # Coarse-to-fine order makes the diagnostic table match the decoder
+        # equations: P16 -> P8 -> P4 -> P2.
+        inter_trace = (inter16, inter8, inter4, inter2)
+        intra_trace = (intra16, intra8, intra4, intra2)
+        return logits, {
+            "projected": tuple(trace["input"] for trace in inter_trace),
+            "patch_priors": tuple(patch_pyramid[name] for name in self.SCALE_NAMES),
+            "native_patch": native_patch,
+            "scores": tuple(trace["score"] for trace in inter_trace),
+            "cosines": tuple(trace["cosine"] for trace in inter_trace),
+            "residuals": tuple(trace["residual"] for trace in inter_trace),
+            "intra_scores": tuple(trace["score"] for trace in intra_trace),
+            "intra_residuals": tuple(trace["residual"] for trace in intra_trace),
+            "pyramid": tuple(pyramid),
+        }
+
+    def forward(self, features, patch_h, patch_w, patch_embedding=None):
+        if patch_embedding is None:
+            raise ValueError("PatchGuidedSADDecoder requires raw patch embedding input")
+        return self._forward_impl(features, patch_embedding, patch_h, patch_w, diagnostics=False)
+
+    def forward_with_diagnostics(self, features, patch_h, patch_w, patch_embedding=None):
+        if patch_embedding is None:
+            raise ValueError("PatchGuidedSADDecoder requires raw patch embedding input")
+        return self._forward_impl(features, patch_embedding, patch_h, patch_w, diagnostics=True)
 
 
 class TPASADBaseDecoder(nn.Module):
@@ -937,6 +1257,8 @@ class DPT(nn.Module):
             "dpa_sad_base",
             "patch_dpa_shared",
             "patch_dpa_independent",
+            "patch_guided_sad",
+            "ltp_cli",
             "semantic_spatial",
             "mlp_same_scale",
         }:
@@ -944,7 +1266,7 @@ class DPT(nn.Module):
                 f"Unknown decoder_variant '{self.decoder_variant}'. "
                 "Expected 'tpa_sad', 'tpa_ms_mlp', 'dpa_ms_mlp', "
                 "'tpa_sad_base', 'dpa_sad_base', 'patch_dpa_shared', "
-                "'patch_dpa_independent', 'semantic_spatial', or "
+                "'patch_dpa_independent', 'patch_guided_sad', 'ltp_cli', 'semantic_spatial', or "
                 "'mlp_same_scale'."
             )
         if self.decoder_variant in {"semantic_spatial", "mlp_same_scale"}:
@@ -978,13 +1300,25 @@ class DPT(nn.Module):
                 )
             if self.wcf_enabled or adaptive_readout:
                 raise ValueError("dpa_sad_base cannot combine WCF or ALSR")
-        if self.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}:
+        if self.decoder_variant in LTP_CLI_VARIANTS:
+            if self.layer_mapping is not None:
+                raise ValueError(
+                    "ltp_cli requires layer_mapping=null: use native [L3,L6,L9,L12]"
+                )
+            if self.wcf_enabled or adaptive_readout:
+                raise ValueError("ltp_cli cannot combine WCF or ALSR")
+        if self.decoder_variant in PATCH_PRIOR_VARIANTS:
             if self.layer_mapping is not None:
                 raise ValueError(
                     f"{self.decoder_variant} requires layer_mapping=null: use native [L3,L6,L9,L12]"
                 )
             if self.wcf_enabled or adaptive_readout:
                 raise ValueError(f"{self.decoder_variant} cannot combine WCF or ALSR")
+            if self.spatial_stride <= 0 or self.spatial_stride > self.patch_size:
+                raise ValueError(
+                    f"{self.decoder_variant} requires 0 < spatial_stride <= patch_size; "
+                    f"got spatial_stride={self.spatial_stride}, patch_size={self.patch_size}"
+                )
         if self.decoder_variant == "semantic_spatial" and (
             self.spatial_stride <= 0 or self.spatial_stride >= self.patch_size
         ):
@@ -1054,6 +1388,18 @@ class DPT(nn.Module):
                 num_classes=self.nclass,
                 adapter_sharing="independent",
             )
+        elif self.decoder_variant == "patch_guided_sad":
+            self.decoder = PatchGuidedSADDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "ltp_cli":
+            self.decoder = LTPCLIMultiScaleMLPDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
         elif self.decoder_variant == "semantic_spatial":
             self.decoder = SemanticSpatialSADDecoder(
                 backbone_channels=self.backbone.embed_dim,
@@ -1107,24 +1453,34 @@ class DPT(nn.Module):
         )
 
     def _raw_patch_embedding(self, x):
-        """Return the original frozen S16 patch projection before the ViT.
+        """Return the frozen K16 patch projection before the ViT.
 
         DINOv3's ``PatchEmbed`` normally continues with flattening and its
-        patch norm.  Patch-guided DPA intentionally stops at the raw
-        ``patch_embed.proj`` output, preserving the original K16/S16
-        projection and its ``[B,384,32,32]`` layout at 512x512.
+        patch norm.  Patch-guided variants intentionally stop at the raw
+        ``patch_embed.proj`` output.  ``spatial_stride`` is functional: it
+        changes the sampling stride while reusing the exact frozen K16
+        weight/bias and never registering a second projection parameter.
         """
         patch_embed = getattr(self.backbone, "patch_embed", None)
         proj = getattr(patch_embed, "proj", None)
         if proj is None or not isinstance(proj, nn.Conv2d):
             raise TypeError("Expected backbone.patch_embed.proj to be nn.Conv2d")
-        expected_stride = (self.patch_size, self.patch_size)
-        if tuple(proj.kernel_size) != expected_stride or tuple(proj.stride) != expected_stride:
+        expected_kernel = (self.patch_size, self.patch_size)
+        if tuple(proj.kernel_size) != expected_kernel:
             raise ValueError(
-                "Patch-guided DPA requires the original K16/S16 patch projection; "
-                f"got kernel={proj.kernel_size}, stride={proj.stride}, expected={expected_stride}"
+                "Patch-guided variants require the original K16 patch kernel; "
+                f"got kernel={proj.kernel_size}, expected={expected_kernel}"
             )
-        return proj(x)
+        stride = (self.spatial_stride, self.spatial_stride)
+        return F.conv2d(
+            x,
+            proj.weight,
+            proj.bias,
+            stride=stride,
+            padding=proj.padding,
+            dilation=proj.dilation,
+            groups=proj.groups,
+        )
 
     def train(self, mode=True):
         """Keep a deliberately frozen DINOv3 backbone in eval mode.
@@ -1160,13 +1516,13 @@ class DPT(nn.Module):
                 feats = self.backbone.get_intermediate_layers(
                     x, n=self.intermediate_layer_idx[self.encoder_size]
                 )
-                if self.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}:
+                if self.decoder_variant in PATCH_PRIOR_VARIANTS:
                     patch_embedding = self._raw_patch_embedding(x)
         else:
             feats = self.backbone.get_intermediate_layers(
                 x, n=self.intermediate_layer_idx[self.encoder_size]
             )
-            if self.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}:
+            if self.decoder_variant in PATCH_PRIOR_VARIANTS:
                 patch_embedding = self._raw_patch_embedding(x)
 
         if self.decoder_variant != "semantic_spatial":
@@ -1182,8 +1538,10 @@ class DPT(nn.Module):
             elif self.layer_mapping is not None:
                 feats = [feats[i] for i in self.layer_mapping]
 
-            if self.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}:
+            if self.decoder_variant in PATCH_PRIOR_VARIANTS:
                 out = self.decoder(feats, patch_h, patch_w, patch_embedding)
+            elif self.decoder_variant in LTP_CLI_VARIANTS:
+                out = self.decoder(feats, patch_h, patch_w, x)
             else:
                 out = self.decoder(feats, patch_h, patch_w)
             returned_feature = feats[-1]
@@ -1207,6 +1565,7 @@ class DPT(nn.Module):
             "dpa_sad_base",
             "patch_dpa_shared",
             "patch_dpa_independent",
+            "patch_guided_sad",
         }:
             raise RuntimeError(
                 "dpa_diagnostics is only available for a DPA decoder variant"
@@ -1219,7 +1578,7 @@ class DPT(nn.Module):
                 )
                 patch_embedding = (
                     self._raw_patch_embedding(x)
-                    if self.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}
+                    if self.decoder_variant in PATCH_PRIOR_VARIANTS
                     else None
                 )
         else:
@@ -1228,10 +1587,10 @@ class DPT(nn.Module):
             )
             patch_embedding = (
                 self._raw_patch_embedding(x)
-                if self.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}
+                if self.decoder_variant in PATCH_PRIOR_VARIANTS
                 else None
             )
-        if self.decoder_variant in {"patch_dpa_shared", "patch_dpa_independent"}:
+        if self.decoder_variant in PATCH_PRIOR_VARIANTS:
             lowres_logits, trace = self.decoder.forward_with_diagnostics(
                 features, patch_h, patch_w, patch_embedding
             )
