@@ -547,6 +547,101 @@ class TPAMultiScaleMLPDecoder(nn.Module):
         )
 
 
+class TPAChangeCascadeDecoder(nn.Module):
+    """TPA pyramid with a ChangeViT-style cascade consumer.
+
+    The official ChangeViT decoder is designed for bi-temporal change
+    detection and therefore also contains pairwise difference modeling and a
+    feature injector.  OSD is single-image semantic segmentation, so this
+    adapter intentionally keeps only the reusable cascade topology:
+    deepest-to-shallowest 1x1 channel alignment, transposed-convolution
+    upsampling, and additive fusion.  The existing OSD TPA/PR path is kept
+    unchanged.
+    """
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__()
+        if len(in_dims) != 4:
+            raise ValueError(f"TPAChangeCascadeDecoder requires four input dims, got {len(in_dims)}")
+        self.token_projections = nn.ModuleList(
+            [nn.Conv2d(channels, decoder_channels, 1, bias=False) for channels in in_dims]
+        )
+        self.tpa_branch_1 = TPAResampleProject(decoder_channels, scale_factor=8)
+        self.tpa_branch_2 = TPAResampleProject(decoder_channels, scale_factor=4)
+        self.tpa_branch_3 = TPAResampleProject(decoder_channels, scale_factor=2)
+        self.tpa_branch_4 = TPAResampleProject(decoder_channels, scale_factor=1)
+
+        # ChangeViT's cascade uses Conv1x1 followed by a 4x4, stride-2
+        # transposed convolution at each coarse-to-fine transition.  All OSD
+        # pyramid branches have the same decoder width, so channel alignment
+        # remains decoder_channels -> decoder_channels.
+        self.up_p16 = nn.Sequential(
+            nn.Conv2d(decoder_channels, decoder_channels, 1, bias=False),
+            nn.ConvTranspose2d(decoder_channels, decoder_channels, kernel_size=4, stride=2, padding=1),
+        )
+        self.up_p8 = nn.Sequential(
+            nn.Conv2d(decoder_channels, decoder_channels, 1, bias=False),
+            nn.ConvTranspose2d(decoder_channels, decoder_channels, kernel_size=4, stride=2, padding=1),
+        )
+        self.up_p4 = nn.Sequential(
+            nn.Conv2d(decoder_channels, decoder_channels, 1, bias=False),
+            nn.ConvTranspose2d(decoder_channels, decoder_channels, kernel_size=4, stride=2, padding=1),
+        )
+        self.classifier = nn.Sequential(
+            nn.ConvTranspose2d(decoder_channels, decoder_channels, kernel_size=4, stride=2, padding=1),
+            nn.Conv2d(decoder_channels, num_classes, kernel_size=3, stride=1, padding=1, bias=False),
+        )
+
+    @staticmethod
+    def _tokens_to_feature_map(x, patch_h, patch_w):
+        if isinstance(x, (list, tuple)):
+            x = x[0]
+        num_patches = patch_h * patch_w
+        if x.ndim != 3:
+            raise ValueError(f"Expected token tensor with 3 dims, got shape {tuple(x.shape)}")
+        if x.shape[1] < num_patches:
+            raise ValueError(
+                f"Token count {x.shape[1]} is smaller than expected patch grid {num_patches}"
+            )
+        if x.shape[1] != num_patches:
+            x = x[:, -num_patches:, :]
+        return x.transpose(1, 2).reshape(x.shape[0], x.shape[-1], patch_h, patch_w)
+
+    def _project_tokens(self, features, patch_h, patch_w):
+        if len(features) != 4:
+            raise ValueError(f"TPAChangeCascadeDecoder requires four features, got {len(features)}")
+        return [
+            projection(self._tokens_to_feature_map(tokens, patch_h, patch_w))
+            for projection, tokens in zip(self.token_projections, features)
+        ]
+
+    def _build_tpa_pyramid(self, projected):
+        if len(projected) != 4:
+            raise ValueError(f"TPA pyramid requires four projected maps, got {len(projected)}")
+        return (
+            self.tpa_branch_1(projected[0]),
+            self.tpa_branch_2(projected[1]),
+            self.tpa_branch_3(projected[2]),
+            self.tpa_branch_4(projected[3]),
+        )
+
+    def _cascade(self, pyramid):
+        if len(pyramid) != 4:
+            raise ValueError(f"ChangeViT cascade requires four pyramid levels, got {len(pyramid)}")
+        p2, p4, p8, p16 = pyramid
+        y16 = p16
+        y8 = p8 + self.up_p16(y16)
+        y4 = p4 + self.up_p8(y8)
+        y2 = p2 + self.up_p4(y4)
+        return y16, y8, y4, y2
+
+    def forward(self, features, patch_h, patch_w):
+        projected = self._project_tokens(features, patch_h, patch_w)
+        pyramid = self._build_tpa_pyramid(projected)
+        _, _, _, y2 = self._cascade(pyramid)
+        return self.classifier(y2)
+
+
 class LTPCLIMultiScaleMLPDecoder(TPAMultiScaleMLPDecoder):
     """B1 plus an RGB token pyramid and cross-linear interaction.
 
@@ -1267,6 +1362,7 @@ class DPT(nn.Module):
         if self.decoder_variant not in {
             "tpa_sad",
             "tpa_ms_mlp",
+            "tpa_change_cascade",
             "dpa_ms_mlp",
             "tpa_sad_base",
             "dpa_sad_base",
@@ -1280,6 +1376,7 @@ class DPT(nn.Module):
             raise ValueError(
                 f"Unknown decoder_variant '{self.decoder_variant}'. "
                 "Expected 'tpa_sad', 'tpa_ms_mlp', 'dpa_ms_mlp', "
+                "'tpa_change_cascade', "
                 "'tpa_sad_base', 'dpa_sad_base', 'patch_dpa_shared', "
                 "'patch_dpa_independent', 'patch_guided_sad', 'ltp_cli', 'semantic_spatial', or "
                 "'mlp_same_scale'."
@@ -1367,6 +1464,12 @@ class DPT(nn.Module):
             )
         elif self.decoder_variant == "tpa_ms_mlp":
             self.decoder = TPAMultiScaleMLPDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "tpa_change_cascade":
+            self.decoder = TPAChangeCascadeDecoder(
                 self.in_dims,
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,

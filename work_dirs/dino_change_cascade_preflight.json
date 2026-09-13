@@ -1,0 +1,141 @@
+{
+  "status": "PASS",
+  "formal_training_started": false,
+  "git_commit": "9e9f1d51fd227f012f4805f9d10552dd107de9e2",
+  "parent_config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_tpa_base_msmlp_osd_512.json",
+  "candidate_config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_tpa_change_cascade_osd_512.json",
+  "parent_variant": "tpa_ms_mlp",
+  "candidate_variant": "tpa_change_cascade",
+  "device": "cuda:0",
+  "seed": 20260901,
+  "protocol_config_diff_after_identity_fields": [],
+  "shared_prefixes": [
+    "backbone.",
+    "decoder.token_projections.",
+    "decoder.tpa_branch_"
+  ],
+  "shared_initialization_keys": 196,
+  "shared_initialization_max_abs_diff": 0.0,
+  "backbone_frozen": true,
+  "backbone_grad_tensors": 0,
+  "intermediate_layers": [
+    "L3",
+    "L6",
+    "L9",
+    "L12"
+  ],
+  "token_grid": [
+    32,
+    32
+  ],
+  "pyramid_shapes_order_P2_P4_P8_P16": [
+    [
+      1,
+      256,
+      256,
+      256
+    ],
+    [
+      1,
+      256,
+      128,
+      128
+    ],
+    [
+      1,
+      256,
+      64,
+      64
+    ],
+    [
+      1,
+      256,
+      32,
+      32
+    ]
+  ],
+  "cascade_stage_shapes_order_P16_Y8_Y4_Y2": [
+    [
+      1,
+      256,
+      32,
+      32
+    ],
+    [
+      1,
+      256,
+      64,
+      64
+    ],
+    [
+      1,
+      256,
+      128,
+      128
+    ],
+    [
+      1,
+      256,
+      256,
+      256
+    ]
+  ],
+  "decoder_output_before_outer_dpt_resize": [
+    1,
+    4,
+    512,
+    512
+  ],
+  "logits_shape": [
+    1,
+    4,
+    512,
+    512
+  ],
+  "transposed_convolution_count": 4,
+  "disallowed_modules": [],
+  "candidate_has_ms_mlp": false,
+  "candidate_only_state_keys": [
+    "decoder.classifier.0.bias",
+    "decoder.classifier.0.weight",
+    "decoder.classifier.1.weight",
+    "decoder.up_p16.0.weight",
+    "decoder.up_p16.1.bias",
+    "decoder.up_p16.1.weight",
+    "decoder.up_p4.0.weight",
+    "decoder.up_p4.1.bias",
+    "decoder.up_p4.1.weight",
+    "decoder.up_p8.0.weight",
+    "decoder.up_p8.1.bias",
+    "decoder.up_p8.1.weight"
+  ],
+  "parent_only_state_keys": [
+    "decoder.ms_mlp.classifier.bias",
+    "decoder.ms_mlp.classifier.weight",
+    "decoder.ms_mlp.fusion.bias",
+    "decoder.ms_mlp.fusion.weight",
+    "decoder.ms_mlp.projections.0.bias",
+    "decoder.ms_mlp.projections.0.weight",
+    "decoder.ms_mlp.projections.1.bias",
+    "decoder.ms_mlp.projections.1.weight",
+    "decoder.ms_mlp.projections.2.bias",
+    "decoder.ms_mlp.projections.2.weight",
+    "decoder.ms_mlp.projections.3.bias",
+    "decoder.ms_mlp.projections.3.weight"
+  ],
+  "parameters": {
+    "parent_total": 24880260,
+    "parent_backbone": 21601152,
+    "parent_decoder": 3279108,
+    "parent_trainable": 3279108,
+    "candidate_total": 28754816,
+    "candidate_backbone": 21601152,
+    "candidate_decoder": 7153664,
+    "candidate_trainable": 7153664,
+    "candidate_minus_parent_total": 3874556,
+    "candidate_minus_parent_trainable": 3874556
+  },
+  "decoder_trainable_gradient_tensors": 20,
+  "decoder_trainable_parameter_tensors": 20,
+  "peak_memory_mib": 1386.99
+}

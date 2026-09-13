@@ -614,6 +614,13 @@ def run(
             "decoder_variant=tpa_ms_mlp; original TPA produces "
             "256/128/64/32 branches; neutral MS-MLP aligns to 256x256; no SAD"
         )
+    elif model_cfg.decoder_variant == "tpa_change_cascade":
+        log_print(
+            "decoder_variant=tpa_change_cascade; existing TPA produces "
+            "P2/P4/P8/P16=256/128/64/32; ChangeViT-style cascade uses "
+            "1x1+4x4 stride-2 deconv and additive top-down fusion; no pairwise "
+            "difference, ResNet detail branch, feature injector, or attention"
+        )
     elif model_cfg.decoder_variant == "dpa_ms_mlp":
         log_print(
             "decoder_variant=dpa_ms_mlp; DPA after token_projection and before "
