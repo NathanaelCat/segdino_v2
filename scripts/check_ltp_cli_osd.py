@@ -193,6 +193,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=CANDIDATE_CONFIG)
     parser.add_argument("--parent-config", type=Path, default=PARENT_CONFIG)
     parser.add_argument("--img-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
@@ -216,6 +217,8 @@ def main() -> None:
         )
     if args.img_size % 16:
         raise ValueError("img-size must be divisible by 16")
+    if args.batch_size <= 0:
+        raise ValueError("batch-size must be positive")
 
     device = torch.device(
         args.device
@@ -249,7 +252,7 @@ def main() -> None:
     if any(float(gamma.detach().item()) != 0.0 for gamma in candidate.decoder.cli.gammas):
         raise RuntimeError("CLI gamma values are not zero-initialized")
 
-    batch_size = 1
+    batch_size = int(args.batch_size)
     patch_h = args.img_size // candidate_cfg.patch_size
     patch_w = args.img_size // candidate_cfg.patch_size
     x = torch.randn(batch_size, 3, args.img_size, args.img_size, device=device)
@@ -282,9 +285,14 @@ def main() -> None:
         "s8": (batch_size, 96, args.img_size // 8, args.img_size // 8),
         "s16": (batch_size, 128, patch_h, patch_w),
         "memory": (batch_size, (args.img_size // 4) ** 2 + (args.img_size // 8) ** 2 + patch_h * patch_w, 64),
+        "memory_position": (batch_size, (args.img_size // 4) ** 2 + (args.img_size // 8) ** 2 + patch_h * patch_w, 64),
+        "query_position": (1, patch_h * patch_w, 64),
         "logits": (batch_size, candidate_cfg.num_classes, args.img_size, args.img_size),
     }
-    actual = {name: tuple(trace[name].shape) for name in ("s4", "s8", "s16", "memory")}
+    actual = {
+        name: tuple(trace[name].shape)
+        for name in ("s4", "s8", "s16", "memory", "memory_position", "query_position")
+    }
     actual["logits"] = tuple(candidate_logits.shape)
     for name, shape in expected.items():
         if actual[name] != shape:
@@ -390,6 +398,8 @@ def main() -> None:
     print(f"S8_shape={actual['s8']}")
     print(f"S16_shape={actual['s16']}")
     print(f"memory_shape={actual['memory']}")
+    print(f"memory_position_shape={actual['memory_position']}")
+    print(f"query_position_shape={actual['query_position']}")
     print(f"Xi_shapes={projected_shapes}")
     print(f"Xi_prime_shapes={calibrated_shapes}")
     print(f"B1_PR_pyramid_shapes={pyramid_shapes}")

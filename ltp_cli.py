@@ -10,6 +10,7 @@ The implementation uses kernelized linear attention throughout.  No
 
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import torch
@@ -181,7 +182,7 @@ def fixed_2d_sincos(height: int, width: int, channels: int, device, dtype) -> to
             torch.tensor(10000.0, device=device, dtype=torch.float32),
             -frequency / max(1, half),
         )
-        phase = position.float().unsqueeze(1) * frequency.unsqueeze(0)
+        phase = (2.0 * math.pi) * position.float().unsqueeze(1) * frequency.unsqueeze(0)
         return torch.cat((phase.sin(), phase.cos()), dim=1)
 
     y = (torch.arange(height, device=device, dtype=torch.float32) + 0.5) / height
@@ -240,6 +241,7 @@ class LightweightTokenPyramid(nn.Module):
         maps = (s4, s8, s16)
 
         memory_parts = []
+        position_parts = []
         for index, (feature, projection) in enumerate(zip(maps, self.memory_projections)):
             batch, channels, height, width = feature.shape
             tokens = feature.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
@@ -251,10 +253,15 @@ class LightweightTokenPyramid(nn.Module):
                 device=tokens.device,
                 dtype=tokens.dtype,
             )
-            tokens = tokens + positions.unsqueeze(0)
-            tokens = tokens + self.scale_embeddings[index].to(dtype=tokens.dtype).view(1, 1, -1)
             memory_parts.append(tokens)
+            scale_embedding = self.scale_embeddings[index].to(dtype=tokens.dtype).view(1, 1, -1)
+            position_parts.append(
+                (positions.unsqueeze(0) + scale_embedding).expand(batch, -1, -1)
+            )
+        # Keep content and geometry separate.  CLI applies the geometry only
+        # after Wk to K; V remains a pure content projection.
         memory = torch.cat(memory_parts, dim=1)
+        memory_position = torch.cat(position_parts, dim=1)
 
         if not return_trace:
             return memory
@@ -263,6 +270,7 @@ class LightweightTokenPyramid(nn.Module):
             "s8": s8,
             "s16": s16,
             "memory": memory,
+            "memory_position": memory_position,
         }
 
 
@@ -305,6 +313,8 @@ class CrossLinearInteraction(nn.Module):
         self,
         projected_features: Sequence[torch.Tensor],
         memory: torch.Tensor,
+        memory_position: torch.Tensor,
+        query_position: torch.Tensor,
         return_trace: bool = False,
     ):
         if len(projected_features) != len(self.query_projections):
@@ -313,7 +323,29 @@ class CrossLinearInteraction(nn.Module):
                 f"got {len(projected_features)}"
             )
         _check_sequence(memory, "CLI memory")
-        key = _split_heads(_relu_kernel(self.key_projection(memory)), self.num_heads)
+        _check_sequence(memory_position, "CLI memory position")
+        if memory_position.shape != memory.shape:
+            raise ValueError(
+                "CLI memory content/position shapes must match: "
+                f"{tuple(memory.shape)} vs {tuple(memory_position.shape)}"
+            )
+        _check_sequence(query_position, "CLI query position")
+        if query_position.shape[0] not in (1, memory.shape[0]):
+            raise ValueError(
+                "CLI query position batch must be 1 or match memory batch, "
+                f"got {query_position.shape[0]} vs {memory.shape[0]}"
+            )
+        if query_position.shape[-1] != self.interaction_channels:
+            raise ValueError(
+                "CLI query position width must equal interaction width, "
+                f"got {query_position.shape[-1]} vs {self.interaction_channels}"
+            )
+
+        # Geometry enters K after Wk and enters Q after Wq.  V is deliberately
+        # content-only, so position cannot leak into the returned detail value.
+        key = _split_heads(
+            _relu_kernel(self.key_projection(memory) + memory_position), self.num_heads
+        )
         value = _split_heads(self.value_projection(memory), self.num_heads)
 
         calibrated = []
@@ -334,7 +366,14 @@ class CrossLinearInteraction(nn.Module):
                     f"CLI expected DINO C={self.query_channels}, got C={channels}"
                 )
             tokens = feature.flatten(2).transpose(1, 2)
-            query = _split_heads(_relu_kernel(query_projection(tokens)), self.num_heads)
+            if query_position.shape[1] != tokens.shape[1]:
+                raise ValueError(
+                    "CLI query position token count must match each DINO grid, "
+                    f"got {query_position.shape[1]} vs {tokens.shape[1]}"
+                )
+            query = _split_heads(
+                _relu_kernel(query_projection(tokens) + query_position), self.num_heads
+            )
             output = _merge_heads(_linear_attention(query, key, value))
             delta = output_projection(output)
             calibrated_tokens = tokens + gamma * delta
@@ -348,6 +387,8 @@ class CrossLinearInteraction(nn.Module):
             return tuple(calibrated)
         return tuple(calibrated), {
             "memory": memory,
+            "memory_position": memory_position,
+            "query_position": query_position,
             "calibrated": tuple(calibrated),
             "interaction_outputs": tuple(interaction_outputs),
         }

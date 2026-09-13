@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ltp_cli import CrossLinearInteraction, LightweightTokenPyramid
+from ltp_cli import CrossLinearInteraction, LightweightTokenPyramid, fixed_2d_sincos
 
 
 PATCH_DPA_VARIANTS = {"patch_dpa_shared", "patch_dpa_independent"}
@@ -588,7 +588,20 @@ class LTPCLIMultiScaleMLPDecoder(TPAMultiScaleMLPDecoder):
             raise ValueError("DINO-LTP-CLI requires the original RGB image")
         projected = self._project_tokens(features, patch_h, patch_w)
         memory, ltp_trace = self.ltp(image, return_trace=True)
-        calibrated, cli_trace = self.cli(projected, memory, return_trace=True)
+        query_position = fixed_2d_sincos(
+            patch_h,
+            patch_w,
+            self.cli.interaction_channels,
+            device=memory.device,
+            dtype=memory.dtype,
+        ).unsqueeze(0)
+        calibrated, cli_trace = self.cli(
+            projected,
+            memory,
+            ltp_trace["memory_position"],
+            query_position,
+            return_trace=True,
+        )
         pyramid = self._build_tpa_pyramid(calibrated)
         logits = self.ms_mlp(pyramid)
         if not diagnostics:
@@ -601,6 +614,8 @@ class LTPCLIMultiScaleMLPDecoder(TPAMultiScaleMLPDecoder):
             "s8": ltp_trace["s8"],
             "s16": ltp_trace["s16"],
             "memory": memory,
+            "memory_position": ltp_trace["memory_position"],
+            "query_position": query_position,
             "interaction_outputs": cli_trace["interaction_outputs"],
         }
 
