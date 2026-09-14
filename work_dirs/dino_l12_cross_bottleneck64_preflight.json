@@ -1,0 +1,173 @@
+{
+  "preflight": "PASS",
+  "test_accessed": false,
+  "config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_l12_spm_cross_msef_bottleneck64_001.json",
+  "device": "cuda:1",
+  "current_variant": "l12_a_cross_bottleneck64",
+  "reference_variant": "l12_a_cross_r",
+  "input_shape": [
+    1,
+    3,
+    512,
+    512
+  ],
+  "logits_shape": [
+    1,
+    4,
+    512,
+    512
+  ],
+  "initial_logits_max_abs_diff_vs_R": 0.0,
+  "sad_shapes": {
+    "sad_intra_1": [
+      1,
+      256,
+      256,
+      256
+    ],
+    "sad_intra_2": [
+      1,
+      256,
+      128,
+      128
+    ],
+    "sad_intra_3": [
+      1,
+      256,
+      64,
+      64
+    ],
+    "sad_intra_4": [
+      1,
+      256,
+      32,
+      32
+    ],
+    "sad_inter_4": [
+      1,
+      256,
+      32,
+      32
+    ],
+    "sad_inter_3": [
+      1,
+      256,
+      64,
+      64
+    ],
+    "sad_inter_2": [
+      1,
+      256,
+      128,
+      128
+    ],
+    "sad_inter_1": [
+      1,
+      256,
+      256,
+      256
+    ]
+  },
+  "bottleneck_block_count": 8,
+  "reference_r_block_count": 8,
+  "cross_msef_count": 3,
+  "backbone_frozen": true,
+  "patch_embed_frozen": true,
+  "backbone_source": "/home/zhengshijie/workspace/Project2/weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+  "params": {
+    "candidate_total": 22197444,
+    "candidate_backbone": 21601152,
+    "candidate_decoder_and_stem": 596292,
+    "candidate_trainable": 596292,
+    "reference_r_total": 22459588,
+    "reference_r_backbone": 21601152,
+    "reference_r_decoder_and_stem": 858436,
+    "reference_r_trainable": 858436,
+    "delta_trainable_candidate_minus_r": -262144,
+    "candidate_block_each": 35585,
+    "r_block_each": 68353,
+    "candidate_blocks_total": 284680,
+    "r_blocks_total": 546824
+  },
+  "gamma_grad_norms_first_backward": [
+    0.12172657251358032,
+    0.009929724037647247,
+    0.05070018395781517,
+    0.009447980672121048,
+    0.3584715723991394,
+    0.09501966834068298,
+    0.3282957375049591,
+    0.011439369060099125
+  ],
+  "candidate_branch_grad_norms_first_backward": {
+    "depthwise": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "down": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "up": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "candidate_branch_grad_norms_after_gamma_step": {
+    "depthwise": [
+      0.00010797134746098891,
+      8.477202209178358e-05,
+      9.21753016882576e-05,
+      7.26714642951265e-05,
+      0.00011052815534640104,
+      0.00010739244316937402,
+      9.92060377029702e-05,
+      6.556264270329848e-05
+    ],
+    "down": [
+      0.0005170710501261055,
+      0.0004600693064276129,
+      0.0004234791558701545,
+      0.0004815200518351048,
+      0.000525115872733295,
+      0.0005148475174792111,
+      0.0004923742963001132,
+      0.0003855544200632721
+    ],
+    "up": [
+      0.0002200081798946485,
+      0.00018780157552100718,
+      0.00022831911337561905,
+      0.00023090319882612675,
+      0.00019820293528027833,
+      0.00023901858367025852,
+      0.0002233909908682108,
+      0.0002252633566968143
+    ]
+  },
+  "benchmark": {
+    "steps": 100,
+    "batch_size": 8,
+    "elapsed_seconds": 50.9061962061096,
+    "seconds_per_step": 0.509061962061096,
+    "peak_memory_mib": 14734.98779296875
+  }
+}

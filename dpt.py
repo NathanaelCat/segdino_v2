@@ -21,6 +21,7 @@ L12_MSEF_VARIANTS = {
     "l12_a_cross_msef",
     "l12_a_cross_r",
     "l12_a_cross_dweca",
+    "l12_a_cross_bottleneck64",
     "l12_a_cross_msef_cdr",
     "l12_a_cross_msef_ds",
     "l12_a_cross_ee",
@@ -32,6 +33,7 @@ CROSS_MSEF_VARIANTS = {
     "l12_a_cross_msef",
     "l12_a_cross_r",
     "l12_a_cross_dweca",
+    "l12_a_cross_bottleneck64",
     "l12_a_cross_msef_cdr",
     "l12_a_cross_msef_ds",
     "l12_a_cross_ee",
@@ -1189,6 +1191,82 @@ class L12ACrossDWECADecoder(L12ACrossMSEFDecoder):
                 name,
                 _construct_with_fixed_seed(
                     lambda: DWECABlock(decoder_channels, groups=32, eca_kernel_size=5),
+                    seed,
+                ),
+            )
+
+
+class BottleneckResidualBlock(nn.Module):
+    """SAD refinement with a nonlinear low-width channel bottleneck.
+
+    The block keeps the R block's local depthwise operation, post-mixer
+    GroupNorm/GELU, and zero-initialized residual scale, while replacing the
+    dense 256->256 pointwise mixer with 256->rank->256 and an intermediate
+    GELU.  This is intentionally a candidate SAD* block rather than a strict
+    linear low-rank factorization.
+    """
+
+    def __init__(self, channels=256, bottleneck=64, groups=32):
+        super().__init__()
+        channels = int(channels)
+        bottleneck = int(bottleneck)
+        groups = int(groups)
+        if channels <= 0 or bottleneck <= 0 or groups <= 0:
+            raise ValueError("channels, bottleneck, and groups must be positive")
+        if channels % groups != 0:
+            raise ValueError("channels must be divisible by groups")
+        self.channels = channels
+        self.bottleneck = bottleneck
+        self.depthwise = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1,
+            groups=channels, bias=False
+        )
+        self.down = nn.Conv2d(channels, bottleneck, kernel_size=1, bias=False)
+        self.inner_act = nn.GELU()
+        self.up = nn.Conv2d(bottleneck, channels, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(groups, channels)
+        self.out_act = nn.GELU()
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError(
+                f"BottleneckResidualBlock expected [B,{self.channels},H,W], "
+                f"got {tuple(x.shape)}"
+            )
+        residual = self.depthwise(x)
+        residual = self.inner_act(self.down(residual))
+        residual = self.up(residual)
+        residual = self.out_act(self.norm(residual))
+        return x + self.gamma * residual
+
+
+class L12ACrossBottleneck64Decoder(L12ACrossMSEFDecoder):
+    """Cross-MSEF front-end with uniform rank-64 bottleneck SAD blocks."""
+
+    BOTTLENECK_SEEDS = {
+        "sad_intra_1": 52001,
+        "sad_intra_2": 52002,
+        "sad_intra_3": 52003,
+        "sad_intra_4": 52004,
+        "sad_inter_4": 52005,
+        "sad_inter_3": 52006,
+        "sad_inter_2": 52007,
+        "sad_inter_1": 52008,
+    }
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed bottleneck experiment requires decoder_channels=256")
+        for name, seed in self.BOTTLENECK_SEEDS.items():
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: BottleneckResidualBlock(
+                        decoder_channels, bottleneck=64, groups=32
+                    ),
                     seed,
                 ),
             )
@@ -3717,6 +3795,7 @@ class DPT(nn.Module):
             "l12_a_cross_msef",
             "l12_a_cross_r",
             "l12_a_cross_dweca",
+            "l12_a_cross_bottleneck64",
             "l12_a_cross_msef_cdr",
             "l12_a_cross_msef_ds",
             "l12_a_cross_ee",
@@ -3996,6 +4075,12 @@ class DPT(nn.Module):
             )
         elif self.decoder_variant == "l12_a_cross_dweca":
             self.decoder = L12ACrossDWECADecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_bottleneck64":
+            self.decoder = L12ACrossBottleneck64Decoder(
                 self.in_dims,
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,
