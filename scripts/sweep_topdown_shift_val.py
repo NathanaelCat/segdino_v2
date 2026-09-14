@@ -187,7 +187,7 @@ def main():
             normal = F.interpolate(
                 decoder.out_conv(
                     decoder.sad_inter_1(
-                        path["u2"] + path["level_1"]
+                        path["u2_normal"] + path["level_1"]
                     )
                 ),
                 size=inputs.shape[-2:],
