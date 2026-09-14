@@ -1,0 +1,389 @@
+{
+  "current_branch": "feat/osd-semantic-spatial-decoupling",
+  "current_commit": "2a1c4ef7d9352621af0ddd002b8fbe15f09760fc",
+  "config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_l12_spm_spsr_msmlp_osd_512.json",
+  "model": "DINO-L12-SPM-SPSR-MSMLP-001",
+  "decoder_variant": "l12_spsr_ms_mlp",
+  "formal_training_started": false,
+  "test_split_accessed": false,
+  "seed": 20260901,
+  "device": "cuda:1",
+  "input_shape": [
+    2,
+    3,
+    512,
+    512
+  ],
+  "l12_tokens_shape": [
+    2,
+    1024,
+    384
+  ],
+  "l12_source_map_shape": [
+    2,
+    256,
+    32,
+    32
+  ],
+  "spatial_prior_shapes": [
+    [
+      2,
+      32,
+      256,
+      256
+    ],
+    [
+      2,
+      64,
+      128,
+      128
+    ],
+    [
+      2,
+      128,
+      64,
+      64
+    ]
+  ],
+  "pyramid_shapes": [
+    [
+      2,
+      256,
+      256,
+      256
+    ],
+    [
+      2,
+      256,
+      128,
+      128
+    ],
+    [
+      2,
+      256,
+      64,
+      64
+    ],
+    [
+      2,
+      256,
+      32,
+      32
+    ]
+  ],
+  "spsr_output_shapes": [
+    [
+      2,
+      256,
+      256,
+      256
+    ],
+    [
+      2,
+      256,
+      128,
+      128
+    ],
+    [
+      2,
+      256,
+      64,
+      64
+    ]
+  ],
+  "resampler_trace_shapes": {
+    "offset_tokens": [
+      [
+        2,
+        4,
+        256,
+        256,
+        2
+      ],
+      [
+        2,
+        4,
+        128,
+        128,
+        2
+      ],
+      [
+        2,
+        4,
+        64,
+        64,
+        2
+      ]
+    ],
+    "grids": [
+      [
+        2,
+        4,
+        256,
+        256,
+        2
+      ],
+      [
+        2,
+        4,
+        128,
+        128,
+        2
+      ],
+      [
+        2,
+        4,
+        64,
+        64,
+        2
+      ]
+    ],
+    "sampled_values": [
+      [
+        2,
+        4,
+        256,
+        256,
+        256
+      ],
+      [
+        2,
+        4,
+        256,
+        128,
+        128
+      ],
+      [
+        2,
+        4,
+        256,
+        64,
+        64
+      ]
+    ],
+    "compatibility": [
+      [
+        2,
+        4,
+        256,
+        256
+      ],
+      [
+        2,
+        4,
+        128,
+        128
+      ],
+      [
+        2,
+        4,
+        64,
+        64
+      ]
+    ],
+    "weights": [
+      [
+        2,
+        4,
+        256,
+        256
+      ],
+      [
+        2,
+        4,
+        128,
+        128
+      ],
+      [
+        2,
+        4,
+        64,
+        64
+      ]
+    ],
+    "resampled": [
+      [
+        2,
+        256,
+        256,
+        256
+      ],
+      [
+        2,
+        256,
+        128,
+        128
+      ],
+      [
+        2,
+        256,
+        64,
+        64
+      ]
+    ]
+  },
+  "source_coordinate_contract": {
+    "source_grid": [
+      32,
+      32
+    ],
+    "num_samples": 4,
+    "offset_limit_source_tokens": 1.0,
+    "align_corners": false,
+    "padding_mode": "border",
+    "anchor_offsets_source_tokens": [
+      [
+        -0.5,
+        -0.5
+      ],
+      [
+        -0.5,
+        0.5
+      ],
+      [
+        0.5,
+        -0.5
+      ],
+      [
+        0.5,
+        0.5
+      ]
+    ]
+  },
+  "logits_shape_native": [
+    2,
+    4,
+    256,
+    256
+  ],
+  "logits_shape_outer": [
+    2,
+    4,
+    512,
+    512
+  ],
+  "gamma_initial": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "gamma_after_one_optimizer_step": [
+    6.545302312588319e-05,
+    9.316142677562311e-05,
+    -9.157267049886286e-05
+  ],
+  "max_learned_offset_at_init_source_tokens": 0.0,
+  "max_weight_sum_error": 1.1920928955078125e-07,
+  "resampled_minus_bilinear_l2": [
+    2.6975395679473877,
+    3.9062533378601074,
+    5.262378692626953
+  ],
+  "gamma_zero_max_abs_diff_native": 0.0,
+  "gamma_zero_max_abs_diff_decoder_outer": 0.0,
+  "gamma_zero_max_abs_diff_outer_vs_fallback": 0.0,
+  "parameter_counts": {
+    "lite_spm_stem_total": 93472,
+    "lite_spm_stem_trainable": 93472,
+    "semantic_projection": 98304,
+    "spatial_projections": 14336,
+    "shared_resampler": 25160,
+    "gamma_parameters": 3,
+    "ms_mlp": 526596,
+    "decoder_total": 664399,
+    "decoder_trainable": 664399,
+    "model_total": 22359023,
+    "backbone_total": 21601152,
+    "model_non_backbone_trainable": 757871
+  },
+  "parameter_names": {
+    "semantic_projection": [
+      "weight"
+    ],
+    "spatial_projections": [
+      "0.weight",
+      "1.weight",
+      "2.weight"
+    ],
+    "shared_resampler": [
+      "offset_predictor.0.weight",
+      "offset_predictor.0.bias",
+      "offset_predictor.2.weight",
+      "offset_predictor.2.bias",
+      "query_projection.weight",
+      "key_projection.weight"
+    ],
+    "gamma": [
+      "gammas.0",
+      "gammas.1",
+      "gammas.2"
+    ]
+  },
+  "estimated_conv_linear_flops_per_forward": {
+    "conv_linear_flops": 121332826112,
+    "conv2d_calls": 25,
+    "linear_calls": 0
+  },
+  "grid_sample_calls_per_forward": 3,
+  "sampled_value_elements_b2": 176160768,
+  "timing_seconds": {
+    "eval_decoder_plus_outer_forward": 0.3826,
+    "first_forward_backward": 0.2136,
+    "second_forward_backward": 0.0589
+  },
+  "memory_after_preflight": {
+    "allocated_mib": 7128.45,
+    "reserved_mib": 11274.0,
+    "peak_allocated_mib": 10704.69
+  },
+  "first_backward": {
+    "loss": 1.3867831230163574,
+    "gamma_grad_norm": [
+      1.894609269470493e-08,
+      1.3622933181522967e-07,
+      1.0866165922607252e-07
+    ],
+    "gamma_grad_finite": [
+      true,
+      true,
+      true
+    ],
+    "offset_final_weight_grad_norm": 0.0,
+    "offset_final_bias_grad_norm": 0.0,
+    "query_grad_norm": 0.0,
+    "key_grad_norm": 0.0
+  },
+  "second_backward": {
+    "loss": 1.3863035440444946,
+    "gamma_grad_norm": [
+      1.822024131570288e-08,
+      1.3026124179305043e-07,
+      1.2860547826676338e-07
+    ],
+    "offset_final_weight_grad_norm": 3.358034683653699e-11,
+    "offset_final_bias_grad_norm": 3.512359500468243e-11,
+    "offset_hidden_grad_norm": 0.0,
+    "query_grad_norm": 2.8713311025704846e-13,
+    "key_grad_norm": 6.142109390538941e-13,
+    "offset_branch_finite": true,
+    "compatibility_branch_finite": true
+  },
+  "backbone_gradient_names": [],
+  "decoder_grad_tensors_after_second_backward": 25,
+  "sanity_checks": {
+    "backbone_frozen": true,
+    "patch_embed_frozen": true,
+    "no_backbone_grad": true,
+    "exact_gamma_zero_native": true,
+    "exact_gamma_zero_outer": true,
+    "outer_shape_contract": true,
+    "initial_offsets_zero": true,
+    "initial_weights_normalized": true,
+    "first_backward_gamma_open": true,
+    "gamma_left_zero_after_step": true,
+    "second_backward_branches_open": true,
+    "forward_backward_finite": true,
+    "decoder_received_gradients": true
+  },
+  "sanity_check": "PASS"
+}

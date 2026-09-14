@@ -14,7 +14,8 @@ PATCH_GUIDED_SAD_VARIANTS = {"patch_guided_sad"}
 PATCH_PRIOR_VARIANTS = PATCH_DPA_VARIANTS | PATCH_GUIDED_SAD_VARIANTS
 LTP_CLI_VARIANTS = {"ltp_cli"}
 SPM_CCFM_VARIANTS = {"spm_ccfm_sad", "spm_ccfm_ms_mlp"}
-SPM_VARIANTS = SPM_CCFM_VARIANTS | {"spm_sad"}
+SPSR_VARIANTS = {"l12_spsr_ms_mlp"}
+SPM_VARIANTS = SPM_CCFM_VARIANTS | {"spm_sad"} | SPSR_VARIANTS
 L12_MSEF_VARIANTS = {
     "l12_a_msef",
     "l12_a_cross_msef",
@@ -1741,6 +1742,325 @@ class LiteSpatialPriorStem(nn.Module):
         return tuple(outputs)
 
 
+class SpatialGuidedSemanticResampler(nn.Module):
+    """Shared sparse resampler for the L12 spatial-prior prototype.
+
+    The source is the projected frozen-DINO L12 map at 1/16 resolution.  A
+    high-resolution RGB spatial-prior map supplies per-target offsets, while
+    the sampled semantic values are ranked by an explicit spatial-query /
+    semantic-value compatibility score.  The module deliberately has no
+    dense attention matrix: it samples ``num_samples`` source points per
+    target location and aggregates only along that small sample dimension.
+
+    Coordinates are expressed in source-token units.  ``grid_sample`` uses
+    the equivalent ``align_corners=False`` normalized coordinates, so the
+    same source coordinate convention is used for P8, P4, and P2.
+    """
+
+    def __init__(
+        self,
+        semantic_channels=256,
+        spatial_channels=64,
+        interaction_dim=64,
+        num_samples=4,
+        offset_limit=1.0,
+    ):
+        super().__init__()
+        semantic_channels = int(semantic_channels)
+        spatial_channels = int(spatial_channels)
+        interaction_dim = int(interaction_dim)
+        num_samples = int(num_samples)
+        if semantic_channels <= 0 or spatial_channels <= 0 or interaction_dim <= 0:
+            raise ValueError("SPSR channel dimensions must be positive")
+        if num_samples != 4:
+            raise ValueError("The SPSR preflight is fixed to K=4 samples")
+        if offset_limit <= 0:
+            raise ValueError("SPSR offset_limit must be positive")
+
+        self.semantic_channels = semantic_channels
+        self.spatial_channels = spatial_channels
+        self.interaction_dim = interaction_dim
+        self.num_samples = num_samples
+        self.offset_limit = float(offset_limit)
+
+        self.offset_predictor = nn.Sequential(
+            nn.Conv2d(spatial_channels, interaction_dim, kernel_size=1, bias=True),
+            nn.GELU(),
+            nn.Conv2d(interaction_dim, 2 * num_samples, kernel_size=1, bias=True),
+        )
+        # Learned offsets start at zero.  The fixed anchors still provide four
+        # distinct source locations, so R-P is non-zero at initialization.
+        nn.init.zeros_(self.offset_predictor[-1].weight)
+        nn.init.zeros_(self.offset_predictor[-1].bias)
+
+        self.query_projection = nn.Conv2d(
+            spatial_channels, interaction_dim, kernel_size=1, bias=False
+        )
+        self.key_projection = nn.Conv2d(
+            semantic_channels, interaction_dim, kernel_size=1, bias=False
+        )
+        # (x, y) offsets in source-token units.  They are deliberately fixed
+        # and small; the learned predictor supplies only the residual offset.
+        self.register_buffer(
+            "anchor_offsets",
+            torch.tensor(
+                [
+                    [-0.5, -0.5],
+                    [-0.5, 0.5],
+                    [0.5, -0.5],
+                    [0.5, 0.5],
+                ],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+
+    @staticmethod
+    def _target_grid(height, width, device, dtype):
+        # Pixel-centre coordinates for align_corners=False.  The resulting
+        # grid maps a target location to the same normalized source position
+        # before an anchor or learned source-token offset is added.
+        y = (torch.arange(height, device=device, dtype=dtype) + 0.5) / height
+        x = (torch.arange(width, device=device, dtype=dtype) + 0.5) / width
+        y = y * 2.0 - 1.0
+        x = x * 2.0 - 1.0
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        return torch.stack((xx, yy), dim=-1)
+
+    def forward(self, semantic_map, spatial_map, gamma, return_trace=False):
+        if semantic_map.ndim != 4 or spatial_map.ndim != 4:
+            raise ValueError("SPSR expects BCHW semantic and spatial maps")
+        if semantic_map.shape[0] != spatial_map.shape[0]:
+            raise ValueError("SPSR semantic/spatial batch sizes do not match")
+        batch_size, channels, source_h, source_w = semantic_map.shape
+        if channels != self.semantic_channels:
+            raise ValueError(
+                f"SPSR semantic channels mismatch: got {channels}, expected {self.semantic_channels}"
+            )
+
+        target_h, target_w = spatial_map.shape[-2:]
+        offset_tokens = self.offset_predictor(spatial_map)
+        offset_tokens = offset_tokens.reshape(
+            batch_size, self.num_samples, 2, target_h, target_w
+        ).permute(0, 1, 3, 4, 2)
+        offset_tokens = torch.tanh(offset_tokens) * self.offset_limit
+
+        base_grid = self._target_grid(
+            target_h, target_w, semantic_map.device, semantic_map.dtype
+        ).view(1, 1, target_h, target_w, 2)
+        source_scale = semantic_map.new_tensor(
+            [2.0 / source_w, 2.0 / source_h]
+        ).view(1, 1, 1, 1, 2)
+        anchor_grid = self.anchor_offsets.to(
+            device=semantic_map.device, dtype=semantic_map.dtype
+        ).view(1, self.num_samples, 1, 1, 2) * source_scale
+        grids = base_grid + anchor_grid + offset_tokens * source_scale
+
+        # Grid sampling is batched over the K fixed candidate points.  No
+        # target-by-source attention matrix is materialized.
+        sampled = F.grid_sample(
+            semantic_map.unsqueeze(1)
+            .expand(-1, self.num_samples, -1, -1, -1)
+            .reshape(batch_size * self.num_samples, channels, source_h, source_w),
+            grids.reshape(batch_size * self.num_samples, target_h, target_w, 2),
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        sampled = sampled.reshape(
+            batch_size, self.num_samples, channels, target_h, target_w
+        )
+
+        query = self.query_projection(spatial_map)
+        key = self.key_projection(
+            sampled.reshape(batch_size * self.num_samples, channels, target_h, target_w)
+        ).reshape(
+            batch_size, self.num_samples, self.interaction_dim, target_h, target_w
+        )
+        compatibility = (
+            query.unsqueeze(1) * key
+        ).sum(dim=2) / (self.interaction_dim ** 0.5)
+        weights = torch.softmax(compatibility, dim=1)
+        resampled = (weights.unsqueeze(2) * sampled).sum(dim=1)
+
+        bilinear = F.interpolate(
+            semantic_map,
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        )
+        residual = resampled - bilinear
+        output = bilinear + gamma * residual
+
+        if not return_trace:
+            return output
+        return output, {
+            "spatial_map": spatial_map,
+            "offset_tokens": offset_tokens,
+            "grids": grids,
+            "sampled_values": sampled,
+            "compatibility": compatibility,
+            "weights": weights,
+            "resampled": resampled,
+            "bilinear": bilinear,
+            "residual": residual,
+        }
+
+
+class L12SPSRMSMLPDecoder(nn.Module):
+    """L12 semantic anchor + RGB SPM + shared SPSR + neutral MS-MLP.
+
+    This is a preflightable prototype, not a trained claim.  The bilinear
+    L12 pyramid remains the identity-safe fallback.  At gamma=0, each SPSR
+    output is exactly its corresponding bilinear map and the final logits
+    equal the fallback MS-MLP logits.
+    """
+
+    def __init__(self, backbone_channels, decoder_channels=256, num_classes=4):
+        super().__init__()
+        if int(decoder_channels) != 256:
+            raise ValueError("The SPSR prototype requires decoder_channels=256")
+        self.backbone_channels = int(backbone_channels)
+        self.decoder_channels = int(decoder_channels)
+        self.spatial_interaction_dim = 64
+        self.num_samples = 4
+        self.semantic_projection = nn.Conv2d(
+            self.backbone_channels, self.decoder_channels, kernel_size=1, bias=False
+        )
+        self.spatial_projections = nn.ModuleList(
+            [
+                nn.Conv2d(32, self.spatial_interaction_dim, kernel_size=1, bias=False),
+                nn.Conv2d(64, self.spatial_interaction_dim, kernel_size=1, bias=False),
+                nn.Conv2d(128, self.spatial_interaction_dim, kernel_size=1, bias=False),
+            ]
+        )
+        self.resampler = SpatialGuidedSemanticResampler(
+            semantic_channels=self.decoder_channels,
+            spatial_channels=self.spatial_interaction_dim,
+            interaction_dim=self.spatial_interaction_dim,
+            num_samples=self.num_samples,
+            offset_limit=1.0,
+        )
+        self.gammas = nn.ParameterList(
+            [nn.Parameter(torch.zeros(1)) for _ in range(3)]
+        )
+        self.ms_mlp = MultiScaleMLPFusion(
+            input_channels=self.decoder_channels,
+            decoder_channels=self.decoder_channels,
+            num_classes=num_classes,
+        )
+
+    @staticmethod
+    def _tokens_to_feature_map(tokens, patch_h, patch_w):
+        if isinstance(tokens, (list, tuple)):
+            tokens = tokens[0]
+        if tokens.ndim != 3:
+            raise ValueError(
+                f"SPSR expects patch tokens [B,N,C], got {tuple(tokens.shape)}"
+            )
+        expected = int(patch_h * patch_w)
+        if tokens.shape[1] != expected:
+            raise ValueError(
+                "SPSR requires patch-only L12 tokens with no CLS/register tokens: "
+                f"got N={tokens.shape[1]}, expected {expected}"
+            )
+        return tokens.transpose(1, 2).reshape(
+            tokens.shape[0], tokens.shape[-1], patch_h, patch_w
+        )
+
+    def _project_l12(self, semantic_tokens, patch_h, patch_w):
+        return self.semantic_projection(
+            self._tokens_to_feature_map(semantic_tokens, patch_h, patch_w)
+        )
+
+    def _build_pyramid(self, semantic_map):
+        return (
+            F.interpolate(
+                semantic_map, scale_factor=8, mode="bilinear", align_corners=False
+            ),
+            F.interpolate(
+                semantic_map, scale_factor=4, mode="bilinear", align_corners=False
+            ),
+            F.interpolate(
+                semantic_map, scale_factor=2, mode="bilinear", align_corners=False
+            ),
+            semantic_map,
+        )
+
+    def _forward_impl(
+        self, semantic_tokens, spatial_features, patch_h, patch_w, return_diagnostics=False
+    ):
+        if len(spatial_features) != 3:
+            raise ValueError(f"SPSR requires D2/D4/D8, got {len(spatial_features)} maps")
+        semantic_map = self._project_l12(semantic_tokens, patch_h, patch_w)
+        p2, p4, p8, p16 = self._build_pyramid(semantic_map)
+        expected = (
+            (patch_h * 8, patch_w * 8),
+            (patch_h * 4, patch_w * 4),
+            (patch_h * 2, patch_w * 2),
+            (patch_h, patch_w),
+        )
+        actual = tuple(feature.shape[-2:] for feature in (*spatial_features, semantic_map))
+        if actual != expected:
+            raise RuntimeError(f"SPSR/SPM scale mismatch: got {actual}, expected {expected}")
+
+        outputs = []
+        traces = []
+        for spatial_projection, pyramid, spatial_feature, gamma in zip(
+            self.spatial_projections,
+            (p2, p4, p8),
+            spatial_features,
+            self.gammas,
+        ):
+            projected_spatial = spatial_projection(spatial_feature)
+            result = self.resampler(
+                pyramid,
+                projected_spatial,
+                gamma,
+                return_trace=return_diagnostics,
+            )
+            if return_diagnostics:
+                result, trace = result
+                trace["projected_spatial"] = projected_spatial
+                trace["gamma"] = gamma
+                traces.append(trace)
+            outputs.append(result)
+
+        candidate_logits = self.ms_mlp((*outputs, p16))
+        if not return_diagnostics:
+            return candidate_logits
+
+        fallback_logits = self.ms_mlp((p2, p4, p8, p16))
+        return candidate_logits, {
+            "semantic_map": semantic_map,
+            "pyramid": (p2, p4, p8, p16),
+            "outputs": tuple(outputs),
+            "projected_spatial": tuple(trace["projected_spatial"] for trace in traces),
+            "resamplers": tuple(traces),
+            "fallback_logits": fallback_logits,
+        }
+
+    def forward(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        return self._forward_impl(
+            semantic_tokens,
+            spatial_features,
+            patch_h,
+            patch_w,
+            return_diagnostics=False,
+        )
+
+    def forward_with_diagnostics(
+        self, semantic_tokens, spatial_features, patch_h, patch_w
+    ):
+        return self._forward_impl(
+            semantic_tokens,
+            spatial_features,
+            patch_h,
+            patch_w,
+            return_diagnostics=True,
+        )
+
+
 class RTDETRConvNormLayer(nn.Module):
     """The ConvNormLayer used by the official RT-DETR HybridEncoder."""
 
@@ -3127,6 +3447,7 @@ class DPT(nn.Module):
             "spm_ccfm_sad",
             "spm_ccfm_ms_mlp",
             "spm_sad",
+            "l12_spsr_ms_mlp",
             "tpa_l12_shared_bilinear",
             "tpa_l12_shared_conv",
             "tpa_l12_independent_bilinear",
@@ -3148,7 +3469,8 @@ class DPT(nn.Module):
                 "'tpa_change_cascade', "
                 "'tpa_sad_base', 'dpa_sad_base', 'patch_dpa_shared', "
                 "'patch_dpa_independent', 'patch_guided_sad', 'ltp_cli', 'semantic_spatial', "
-                "'mlp_same_scale', 'spm_ccfm_sad', 'spm_ccfm_ms_mlp', 'spm_sad', or "
+                "'mlp_same_scale', 'spm_ccfm_sad', 'spm_ccfm_ms_mlp', 'spm_sad', "
+                "'l12_spsr_ms_mlp', or "
                 "an L12 factorial/MSEF variant."
             )
         if self.decoder_variant in {"semantic_spatial", "mlp_same_scale"}:
@@ -3355,6 +3677,12 @@ class DPT(nn.Module):
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,
                 use_group_norm=not use_bn,
+            )
+        elif self.decoder_variant == "l12_spsr_ms_mlp":
+            self.decoder = L12SPSRMSMLPDecoder(
+                backbone_channels=self.backbone.embed_dim,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
             )
         elif self.decoder_variant in {
             "tpa_l12_shared_bilinear",
