@@ -20,6 +20,7 @@ L12_MSEF_VARIANTS = {
     "l12_a_msef",
     "l12_a_cross_msef",
     "l12_a_cross_r",
+    "l12_a_cross_dweca",
     "l12_a_cross_msef_cdr",
     "l12_a_cross_msef_ds",
     "l12_a_cross_ee",
@@ -30,6 +31,7 @@ L12_MSEF_VARIANTS = {
 CROSS_MSEF_VARIANTS = {
     "l12_a_cross_msef",
     "l12_a_cross_r",
+    "l12_a_cross_dweca",
     "l12_a_cross_msef_cdr",
     "l12_a_cross_msef_ds",
     "l12_a_cross_ee",
@@ -1115,6 +1117,78 @@ class L12ACrossRDecoder(L12ACrossMSEFDecoder):
                     lambda: ResidualDepthwiseBlock(
                         decoder_channels, use_group_norm=True
                     ),
+                    seed,
+                ),
+            )
+
+
+class DWECABlock(nn.Module):
+    """Lightweight depthwise spatial refinement with ECA recalibration.
+
+    This is the SAD-DW-ECA candidate.  The normalization follows the original
+    SAD-R block's GroupNorm convention, while the dense 1x1 channel mixing and
+    GELU are removed.  A standard ECA 1-D channel interaction is applied to
+    the globally pooled depthwise response.  The outer scalar gamma is
+    zero-initialized so each block is an exact identity at initialization.
+    """
+
+    def __init__(self, channels=256, groups=32, eca_kernel_size=5):
+        super().__init__()
+        channels = int(channels)
+        groups = int(groups)
+        eca_kernel_size = int(eca_kernel_size)
+        if channels <= 0 or groups <= 0 or channels % groups != 0:
+            raise ValueError("channels must be positive and divisible by groups")
+        if eca_kernel_size <= 0 or eca_kernel_size % 2 == 0:
+            raise ValueError("ECA kernel size must be a positive odd integer")
+        self.channels = channels
+        self.eca_kernel_size = eca_kernel_size
+        self.norm = nn.GroupNorm(groups, channels)
+        self.depthwise = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1,
+            groups=channels, bias=False
+        )
+        self.eca = nn.Conv1d(
+            1, 1, kernel_size=eca_kernel_size,
+            padding=eca_kernel_size // 2, bias=False
+        )
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError(
+                f"DWECABlock expected [B,{self.channels},H,W], got {tuple(x.shape)}"
+            )
+        z = self.depthwise(self.norm(x))
+        pooled = F.adaptive_avg_pool2d(z, output_size=1).flatten(1).unsqueeze(1)
+        attention = torch.sigmoid(self.eca(pooled)).squeeze(1).unsqueeze(-1).unsqueeze(-1)
+        return x + self.gamma * (attention * z)
+
+
+class L12ACrossDWECADecoder(L12ACrossMSEFDecoder):
+    """Cross-MSEF front-end with uniform DW-ECA blocks in SAD."""
+
+    DWECA_SEEDS = {
+        "sad_intra_1": 51001,
+        "sad_intra_2": 51002,
+        "sad_intra_3": 51003,
+        "sad_intra_4": 51004,
+        "sad_inter_4": 51005,
+        "sad_inter_3": 51006,
+        "sad_inter_2": 51007,
+        "sad_inter_1": 51008,
+    }
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed DW-ECA experiment requires decoder_channels=256")
+        for name, seed in self.DWECA_SEEDS.items():
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: DWECABlock(decoder_channels, groups=32, eca_kernel_size=5),
                     seed,
                 ),
             )
@@ -3642,6 +3716,7 @@ class DPT(nn.Module):
             "l12_a_msef",
             "l12_a_cross_msef",
             "l12_a_cross_r",
+            "l12_a_cross_dweca",
             "l12_a_cross_msef_cdr",
             "l12_a_cross_msef_ds",
             "l12_a_cross_ee",
@@ -3915,6 +3990,12 @@ class DPT(nn.Module):
             )
         elif self.decoder_variant == "l12_a_cross_r":
             self.decoder = L12ACrossRDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_dweca":
+            self.decoder = L12ACrossDWECADecoder(
                 self.in_dims,
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,

@@ -697,6 +697,13 @@ def run(
             "interaction_dim=64; all eight SAD positions use the original "
             "ResidualDepthwiseBlock; no checkpoint initialization"
         )
+    elif model_cfg.decoder_variant == "l12_a_cross_dweca":
+        log_print(
+            "decoder_variant=l12_a_cross_dweca; Cross-MSEF front-end is unchanged; "
+            "all eight SAD positions use DW-ECA (GroupNorm + depthwise 3x3 + "
+            "ECA kernel=5) with zero-initialized scalar gamma; no dense "
+            "pointwise mixing and no checkpoint initialization"
+        )
     elif model_cfg.decoder_variant == "l12_a_cross_msef_cdr":
         log_print(
             "decoder_variant=l12_a_cross_msef_cdr; Cross-MSEF front-end is unchanged; "
