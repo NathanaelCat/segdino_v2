@@ -113,8 +113,10 @@ def _sample_train_indices(mask: torch.Tensor, target: torch.Tensor, cap: int, se
     """Class-balanced sample from one image's mixed pixels."""
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
-    flat_mask = mask.reshape(-1)
-    flat_target = target.reshape(-1)
+    # Sampling metadata is deliberately kept on CPU; feature tensors can
+    # remain on GPU.  This avoids mixing CPU selection masks with CUDA indices.
+    flat_mask = mask.detach().reshape(-1).cpu()
+    flat_target = target.detach().reshape(-1).cpu()
     available = torch.nonzero(flat_mask, as_tuple=False).flatten()
     if available.numel() <= cap:
         return available
