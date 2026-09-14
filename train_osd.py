@@ -539,6 +539,17 @@ def run(
             "Set loss.name='CrossEntropyLoss' explicitly for mutually exclusive OSD labels"
         )
     criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
+    deep_supervision_weights = tuple(
+        float(value)
+        for value in training.get("deep_supervision_weights", [0.2, 0.2, 0.2])
+    )
+    if model_cfg.decoder_variant == "l12_a_cross_msef_ds":
+        if len(deep_supervision_weights) != 3:
+            raise ValueError(
+                "l12_a_cross_msef_ds requires exactly three weights for inter3/inter2/inter1"
+            )
+        if any(value < 0 for value in deep_supervision_weights):
+            raise ValueError("deep_supervision_weights must be non-negative")
     amp_enabled = bool(runtime.get("amp", False)) and device.type == "cuda"
     amp_dtype_name = runtime.get("amp_dtype", "float16")
     if amp_dtype_name not in {"float16", "bfloat16"}:
@@ -611,6 +622,61 @@ def run(
             "MSEF core (LayerNorm + depthwise 3x3 + SE), wrapped by "
             "zero-initialized residual gamma; reduction=16"
         )
+    elif model_cfg.decoder_variant == "l12_a_msef":
+        log_print(
+            "decoder_variant=l12_a_msef; factorial-A shared 1x1 projection "
+            "with bilinear-only L12 P2/P4/P8/P16; all eight SAD-R locations "
+            "use the unwrapped official MSEF (LN + DWConv3x3 + full SE feature); "
+            "no checkpoint initialization"
+        )
+    elif model_cfg.decoder_variant == "l12_a_cross_msef":
+        log_print(
+            "decoder_variant=l12_a_cross_msef; A-MSEF L12 semantic pyramid "
+            "plus RGB Lite-SPM D2/D4/D8; Cross-MSEF at P2/P4/P8 with "
+            "interaction_dim=64 and zero-initialized gamma; P16 unchanged; "
+            "no checkpoint initialization"
+        )
+    elif model_cfg.decoder_variant == "l12_a_cross_r":
+        log_print(
+            "decoder_variant=l12_a_cross_r; A shared 1x1 + bilinear L12 pyramid "
+            "plus RGB Lite-SPM D2/D4/D8; Cross-MSEF at P2/P4/P8 with "
+            "interaction_dim=64; all eight SAD positions use the original "
+            "ResidualDepthwiseBlock; no checkpoint initialization"
+        )
+    elif model_cfg.decoder_variant == "l12_a_cross_msef_cdr":
+        log_print(
+            "decoder_variant=l12_a_cross_msef_cdr; Cross-MSEF front-end is unchanged; "
+            "all eight SAD positions use the same CDR block (LN + low/high split + "
+            "context-selected detail); beta_init=1; no auxiliary loss"
+        )
+    elif model_cfg.decoder_variant == "l12_a_cross_msef_ds":
+        log_print(
+            "decoder_variant=l12_a_cross_msef_ds; Cross-MSEF + eight MSEF SAD blocks "
+            "are unchanged; auxiliary CE heads follow inter3/inter2/inter1 with "
+            f"weights={list(deep_supervision_weights)}; inference uses final head only"
+        )
+    elif model_cfg.decoder_variant in {"l12_a_cross_ee", "l12_a_cross_see"}:
+        activation = "Sigmoid" if model_cfg.decoder_variant == "l12_a_cross_ee" else "Tanh"
+        log_print(
+            f"decoder_variant={model_cfg.decoder_variant}; Cross-MSEF front-end is unchanged; "
+            f"all eight SAD positions use uniform EdgeEnhancer ({activation}); "
+            "edge=x-AvgPool3x3(x), Conv1x1, GroupNorm, activation, residual add; "
+            "count_include_pad=False; no R/MSEF/CDR/deep supervision; no checkpoint initialization"
+        )
+    elif model_cfg.decoder_variant == "l12_a_cross_r_weighted":
+        log_print(
+            "decoder_variant=l12_a_cross_r_weighted; Cross-MSEF front-end and all "
+            "eight original SAD-R blocks are unchanged; P8/P4/P2 top-down fusion "
+            "uses three pairs of zero-initialized scalar weights, initialized to "
+            "exact P+Up; no checkpoint initialization"
+        )
+    elif model_cfg.decoder_variant == "l12_a_cross_r_dysample_splus":
+        log_print(
+            "decoder_variant=l12_a_cross_r_dysample_splus; Cross-MSEF front-end "
+            "and all eight original SAD-R blocks are unchanged; only the three "
+            "inter bilinear upsampling sites use official DySample-S+ "
+            "(style=pl, groups=8, dyscope=True, scale=2); no checkpoint initialization"
+        )
     elif model_cfg.decoder_variant == "mlp_same_scale":
         log_print(
             "decoder_variant=mlp_same_scale; four native [L3,L6,L9,L12] "
@@ -665,6 +731,26 @@ def run(
             f"RT-DETR CCFM outputs C2/C4/C8/C16; backend={backend}; "
             "no TPA/PR and no detection/query head"
         )
+    elif model_cfg.decoder_variant in {
+        "tpa_l12_shared_bilinear",
+        "tpa_l12_shared_conv",
+        "tpa_l12_independent_bilinear",
+        "tpa_l12_independent_conv",
+    }:
+        projection = (
+            "shared 1x1 projection"
+            if "shared" in model_cfg.decoder_variant
+            else "four independent 1x1 projections"
+        )
+        spatial = (
+            "four independent dense 3x3 TPA branch convolutions"
+            if model_cfg.decoder_variant.endswith("_conv")
+            else "bilinear-only scale expansion"
+        )
+        log_print(
+            f"decoder_variant={model_cfg.decoder_variant}; layer_mapping=[3,3,3,3] "
+            f"(L12x4); {projection}; {spatial}; exact current SAD consumer"
+        )
 
     epochs = training.get("epochs")
     max_iters = training.get("max_iters")
@@ -715,6 +801,8 @@ def run(
 
     running_loss_sum = 0.0
     running_loss_count = 0
+    running_final_loss_sum = 0.0
+    running_aux_loss_sum = 0.0
 
     for step in range(1, max_iters + 1):
         try:
@@ -726,11 +814,35 @@ def run(
         inputs = inputs.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
+        final_loss_value = None
+        aux_loss_value = None
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-            logits = model(inputs)
+            if model_cfg.decoder_variant == "l12_a_cross_msef_ds":
+                final_logits, aux_logits = model.forward_with_aux(inputs)
+                logits = final_logits
+                if len(aux_logits) != 3:
+                    raise ValueError(
+                        f"Expected 3 auxiliary logits, got {len(aux_logits)}"
+                    )
+                final_loss = criterion(final_logits, targets)
+                aux_loss = sum(
+                    weight * criterion(aux, targets)
+                    for weight, aux in zip(deep_supervision_weights, aux_logits)
+                )
+                loss = final_loss + aux_loss
+                final_loss_value = final_loss.detach()
+                aux_loss_value = aux_loss.detach()
+            else:
+                logits = model(inputs)
+                loss = criterion(logits, targets)
             if logits.shape[-2:] != targets.shape[-2:]:
                 raise ValueError(f"Output/target shape mismatch: {logits.shape} vs {targets.shape}")
-            loss = criterion(logits, targets)
+            if model_cfg.decoder_variant == "l12_a_cross_msef_ds":
+                for aux in aux_logits:
+                    if aux.shape[-2:] != targets.shape[-2:]:
+                        raise ValueError(
+                            f"Aux output/target shape mismatch: {aux.shape} vs {targets.shape}"
+                        )
         if amp_enabled:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -744,6 +856,10 @@ def run(
         loss_val = float(loss.detach().cpu())
         running_loss_sum += loss_val
         running_loss_count += 1
+        if final_loss_value is not None:
+            running_final_loss_sum += float(final_loss_value.cpu())
+        if aux_loss_value is not None:
+            running_aux_loss_sum += float(aux_loss_value.cpu())
 
         if step == 1 or step % log_interval == 0:
             now = time.perf_counter()
@@ -787,8 +903,20 @@ def run(
                 selection_metrics, confusion, evaluated_images = evaluation
                 dpa_stats = None
             epoch_mean_loss = running_loss_sum / max(1, running_loss_count)
+            epoch_final_loss = (
+                running_final_loss_sum / max(1, running_loss_count)
+                if model_cfg.decoder_variant == "l12_a_cross_msef_ds"
+                else None
+            )
+            epoch_aux_loss = (
+                running_aux_loss_sum / max(1, running_loss_count)
+                if model_cfg.decoder_variant == "l12_a_cross_msef_ds"
+                else None
+            )
             running_loss_sum = 0.0
             running_loss_count = 0
+            running_final_loss_sum = 0.0
+            running_aux_loss_sum = 0.0
             cur_lr = float(optimizer.param_groups[-1]["lr"])
             epoch_idx = int((step - 1) // len(train_loader) + 1)
             record = {
@@ -801,6 +929,9 @@ def run(
                 "selection_metrics": selection_metrics,
                 "evaluated_images": evaluated_images,
             }
+            if epoch_final_loss is not None:
+                record["final_train_loss"] = epoch_final_loss
+                record["aux_train_loss"] = epoch_aux_loss
             if dpa_stats is not None:
                 record["dpa_stats"] = dpa_stats
             ltp_cli_gammas = None
@@ -824,6 +955,12 @@ def run(
                 f"Water={selection_metrics['IoU_water_global']:.2f}% | "
                 f"Others={selection_metrics['IoU_others_global']:.2f}%"
             )
+            if epoch_final_loss is not None:
+                log_print(
+                    f"  Deep supervision losses: final={epoch_final_loss:.5f} "
+                    f"aux_weighted={epoch_aux_loss:.5f} "
+                    f"weights={list(deep_supervision_weights)}"
+                )
             if dpa_stats is not None:
                 alpha_str = " ".join(
                     f"{name}={value:.6f}" for name, value in dpa_stats["alpha"].items()

@@ -11,6 +11,28 @@ PATCH_PRIOR_VARIANTS = PATCH_DPA_VARIANTS | PATCH_GUIDED_SAD_VARIANTS
 LTP_CLI_VARIANTS = {"ltp_cli"}
 SPM_CCFM_VARIANTS = {"spm_ccfm_sad", "spm_ccfm_ms_mlp"}
 SPM_VARIANTS = SPM_CCFM_VARIANTS | {"spm_sad"}
+L12_MSEF_VARIANTS = {
+    "l12_a_msef",
+    "l12_a_cross_msef",
+    "l12_a_cross_r",
+    "l12_a_cross_msef_cdr",
+    "l12_a_cross_msef_ds",
+    "l12_a_cross_ee",
+    "l12_a_cross_see",
+    "l12_a_cross_r_weighted",
+    "l12_a_cross_r_dysample_splus",
+}
+CROSS_MSEF_VARIANTS = {
+    "l12_a_cross_msef",
+    "l12_a_cross_r",
+    "l12_a_cross_msef_cdr",
+    "l12_a_cross_msef_ds",
+    "l12_a_cross_ee",
+    "l12_a_cross_see",
+    "l12_a_cross_r_weighted",
+    "l12_a_cross_r_dysample_splus",
+}
+DEEP_SUPERVISION_VARIANTS = {"l12_a_cross_msef_ds"}
 
 
 class L12AnchoredWCF(nn.Module):
@@ -158,6 +180,199 @@ class MSEFResidualBlock(nn.Module):
 
     def forward(self, x):
         return x + self.gamma * self._msef_core(x)
+
+
+class CDRBlock(nn.Module):
+    """Context-guided Detail Refinement block used at every SAD position.
+
+    The block deliberately uses one identical definition at all four intra
+    and four top-down SAD locations:
+
+        Z = channel-wise LayerNorm(X)
+        B = AvgPool3x3(Z)
+        H = Z - B
+        C = Group1x1(GELU(DWConv3x3(Z)))
+        D = GELU(DWConv3x3(H))
+        A = sigmoid(Group1x1(B))
+        Y = X + C + beta * (A * D)
+
+    All convolutions are bias-free to keep the block lightweight.  ``beta``
+    is initialized to one as prescribed for the fresh CDR replacement
+    experiment; there is no SE, feature multiplication, or outer zero-gamma.
+    """
+
+    def __init__(self, channels=256, groups=32):
+        super().__init__()
+        channels = int(channels)
+        groups = int(groups)
+        if channels <= 0 or groups <= 0 or channels % groups != 0:
+            raise ValueError("CDR channels must be positive and divisible by groups")
+        self.channels = channels
+        self.groups = groups
+        self.norm = nn.LayerNorm(channels)
+        self.local_depthwise = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, groups=channels, bias=False
+        )
+        self.local_projection = nn.Conv2d(
+            channels, channels, kernel_size=1, groups=groups, bias=False
+        )
+        self.detail_depthwise = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, groups=channels, bias=False
+        )
+        self.context_gate = nn.Conv2d(
+            channels, channels, kernel_size=1, groups=groups, bias=False
+        )
+        self.act = nn.GELU()
+        self.beta = nn.Parameter(torch.tensor(1.0))
+
+    def _normalize(self, x):
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+    def _forward_impl(self, x):
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError(
+                f"CDR expected [B,{self.channels},H,W], got {tuple(x.shape)}"
+            )
+        z = self._normalize(x)
+        low = F.avg_pool2d(
+            z, kernel_size=3, stride=1, padding=1, count_include_pad=False
+        )
+        high = z - low
+
+        local = self.local_depthwise(z)
+        local = self.act(local)
+        local = self.local_projection(local)
+
+        detail = self.detail_depthwise(high)
+        detail = self.act(detail)
+        attention = torch.sigmoid(self.context_gate(low))
+        selected_detail = attention * detail
+        output = x + local + self.beta * selected_detail
+        trace = {
+            "X": x,
+            "C": local,
+            "D": detail,
+            "A": attention,
+            "A_times_D": selected_detail,
+            "Y": output,
+        }
+        return output, trace
+
+    def forward(self, x):
+        return self._forward_impl(x)[0]
+
+    def forward_with_trace(self, x):
+        return self._forward_impl(x)
+
+
+class EdgeEnhancerBlock(nn.Module):
+    """The official EdgeEnhancer operator used as an OSD SAD replacement.
+
+    The reference operator is a residual high-pass path::
+
+        edge = x - AvgPool3x3(x)
+        edge = Conv1x1(edge) -> Norm(edge) -> activation(edge)
+        y = x + edge
+
+    ``activation`` is the sole difference between the two experiments:
+    ``sigmoid`` is the original EE and ``tanh`` is Signed-EE.  The OSD
+    protocol uses GroupNorm when ``use_bn=false``; the same normalization is
+    therefore used for both variants so their comparison changes only the
+    response range.  ``count_include_pad=False`` is fixed by the OSD
+    experiment specification to avoid a border-dependent average.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        activation: str = "sigmoid",
+        groups: int = 32,
+        count_include_pad: bool = False,
+    ):
+        super().__init__()
+        channels = int(channels)
+        groups = int(groups)
+        if channels <= 0 or groups <= 0 or channels % groups != 0:
+            raise ValueError("EdgeEnhancer channels must be positive and divisible by groups")
+        activation = str(activation).lower()
+        if activation not in {"sigmoid", "tanh"}:
+            raise ValueError(f"Unsupported EdgeEnhancer activation: {activation}")
+        self.channels = channels
+        self.activation = activation
+        self.pool = nn.AvgPool2d(
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            count_include_pad=bool(count_include_pad),
+        )
+        self.out_conv = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(groups, channels)
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError(
+                f"EdgeEnhancer expected [B,{self.channels},H,W], got {tuple(x.shape)}"
+            )
+        edge = x - self.pool(x)
+        edge = self.norm(self.out_conv(edge))
+        if self.activation == "sigmoid":
+            edge = torch.sigmoid(edge)
+        else:
+            edge = torch.tanh(edge)
+        return x + edge
+
+
+class OfficialMSEFBlock(nn.Module):
+    """The unwrapped MultiNex MSEF operation used by the new A parent.
+
+    This intentionally does not contain the zero-initialized outer residual
+    coefficient used by the historical OSD MSEF experiment.  The operation is
+    exactly::
+
+        z = LayerNorm(x)
+        l = DWConv3x3(z)
+        c = z * tanh(FC2(ReLU(FC1(GAP(z)))))
+        out = x + l * c
+
+    The channel-last LayerNorm is only a layout change; the module's public
+    contract remains BCHW.  ``c`` is the complete ``z * channel_weight``
+    feature, not just the channel gate.
+    """
+
+    def __init__(self, channels, reduction_ratio=16):
+        super().__init__()
+        channels = int(channels)
+        reduction_ratio = int(reduction_ratio)
+        if channels <= 0 or reduction_ratio <= 0:
+            raise ValueError("channels and reduction_ratio must be positive")
+        hidden = max(1, channels // reduction_ratio)
+        self.channels = channels
+        self.reduction_ratio = reduction_ratio
+        self.layer_norm = nn.LayerNorm(channels)
+        self.depthwise_conv = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            padding=1,
+            groups=channels,
+            bias=True,
+        )
+        self.se_fc1 = nn.Linear(channels, hidden)
+        self.se_fc2 = nn.Linear(hidden, channels)
+
+    def _normalized(self, x):
+        x = x.permute(0, 2, 3, 1)
+        x = self.layer_norm(x)
+        return x.permute(0, 3, 1, 2)
+
+    def forward(self, x):
+        z = self._normalized(x)
+        local = self.depthwise_conv(z)
+        pooled = F.adaptive_avg_pool2d(z, output_size=1).flatten(1)
+        channel_weight = torch.tanh(self.se_fc2(F.relu(self.se_fc1(pooled))))
+        channel_weight = channel_weight.view(x.shape[0], self.channels, 1, 1)
+        channel_feature = z * channel_weight
+        return x + local * channel_feature
 
 
 class TPAResampleProject(nn.Module):
@@ -363,6 +578,901 @@ class TPASADDecoder(nn.Module):
         x1 = self.sad_inter_1(x1_up + level_1)
 
         return self.out_conv(x1)
+
+
+def _construct_with_fixed_seed(factory, seed):
+    """Construct a CPU module with a seed independent of constructor order.
+
+    The factorial runs share the initialization of their common parameters so
+    that a single-seed comparison is not also a comparison of unrelated SAD
+    or projection initializations.  The caller's RNG state is restored.
+    """
+    cpu_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        torch.manual_seed(int(seed))
+        return factory()
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+class TPAL12FactorialDecoder(nn.Module):
+    """CTRL-002 TPA/SAD with two independently switchable TPA factors.
+
+    This is a controlled decoder-side ablation for the already fixed
+    ``layer_mapping=[3,3,3,3]`` protocol.  The four inputs are therefore all
+    L12, while the decoder can independently vary:
+
+    * projection sharing: one 1x1 projection reused four times vs. four
+      independent 1x1 projections;
+    * spatial reconstruction: bilinear-only scale expansion vs. the four
+      independent 3x3 convolutions used by CTRL-002.
+
+    SAD is copied exactly from ``TPASADDecoder`` in every cell.  The D cell is
+    the existing CTRL-002 result and is not retrained.
+    """
+
+    INIT_SEEDS = {
+        "shared_projection": 41001,
+        "projection_0": 41001,
+        "projection_1": 41002,
+        "projection_2": 41003,
+        "projection_3": 41004,
+        "branch_1": 42001,
+        "branch_2": 42002,
+        "branch_3": 42003,
+        "branch_4": 42004,
+        "sad_intra_1": 43001,
+        "sad_intra_2": 43002,
+        "sad_intra_3": 43003,
+        "sad_intra_4": 43004,
+        "sad_inter_4": 43005,
+        "sad_inter_3": 43006,
+        "sad_inter_2": 43007,
+        "sad_inter_1": 43008,
+        "out_conv": 44001,
+    }
+
+    def __init__(
+        self,
+        in_dims,
+        decoder_channels=256,
+        num_classes=4,
+        use_group_norm=True,
+        projection_mode="shared",
+        use_spatial_conv=False,
+    ):
+        super().__init__()
+        if len(in_dims) != 4:
+            raise ValueError(
+                f"TPAL12FactorialDecoder requires four input dims, got {len(in_dims)}"
+            )
+        if projection_mode not in {"shared", "independent"}:
+            raise ValueError(f"Unknown projection_mode={projection_mode!r}")
+
+        self.projection_mode = projection_mode
+        self.use_spatial_conv = bool(use_spatial_conv)
+        self.decoder_channels = int(decoder_channels)
+
+        if projection_mode == "shared":
+            self.shared_token_projection = _construct_with_fixed_seed(
+                lambda: nn.Conv2d(in_dims[0], decoder_channels, 1, bias=False),
+                self.INIT_SEEDS["shared_projection"],
+            )
+            self.token_projections = None
+        else:
+            self.shared_token_projection = None
+            self.token_projections = nn.ModuleList(
+                [
+                    _construct_with_fixed_seed(
+                        lambda channels=channels, index=index: nn.Conv2d(
+                            channels, decoder_channels, 1, bias=False
+                        ),
+                        self.INIT_SEEDS[f"projection_{index}"],
+                    )
+                    for index, channels in enumerate(in_dims)
+                ]
+            )
+
+        if self.use_spatial_conv:
+            self.tpa_branches = nn.ModuleList(
+                [
+                    _construct_with_fixed_seed(
+                        lambda scale=scale: TPAResampleProject(
+                            decoder_channels, scale_factor=scale
+                        ),
+                        self.INIT_SEEDS[f"branch_{index}"],
+                    )
+                    for index, scale in enumerate((8, 4, 2, 1), start=1)
+                ]
+            )
+        else:
+            self.tpa_branches = None
+
+        # Keep the SAD consumer identical in all four cells.
+        for name, seed in (
+            ("sad_intra_1", self.INIT_SEEDS["sad_intra_1"]),
+            ("sad_intra_2", self.INIT_SEEDS["sad_intra_2"]),
+            ("sad_intra_3", self.INIT_SEEDS["sad_intra_3"]),
+            ("sad_intra_4", self.INIT_SEEDS["sad_intra_4"]),
+            ("sad_inter_4", self.INIT_SEEDS["sad_inter_4"]),
+            ("sad_inter_3", self.INIT_SEEDS["sad_inter_3"]),
+            ("sad_inter_2", self.INIT_SEEDS["sad_inter_2"]),
+            ("sad_inter_1", self.INIT_SEEDS["sad_inter_1"]),
+        ):
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: ResidualDepthwiseBlock(
+                        decoder_channels, use_group_norm=use_group_norm
+                    ),
+                    seed,
+                ),
+            )
+        self.out_conv = _construct_with_fixed_seed(
+            lambda: nn.Conv2d(decoder_channels, num_classes, 1),
+            self.INIT_SEEDS["out_conv"],
+        )
+
+    @staticmethod
+    def _tokens_to_feature_map(x, patch_h, patch_w):
+        if isinstance(x, (list, tuple)):
+            x = x[0]
+        num_patches = patch_h * patch_w
+        if x.ndim != 3:
+            raise ValueError(f"Expected token tensor with 3 dims, got shape {tuple(x.shape)}")
+        if x.shape[1] < num_patches:
+            raise ValueError(
+                f"Token count {x.shape[1]} is smaller than expected patch grid {num_patches}"
+            )
+        if x.shape[1] != num_patches:
+            x = x[:, -num_patches:, :]
+        return x.transpose(1, 2).reshape(x.shape[0], x.shape[-1], patch_h, patch_w)
+
+    def _project_tokens(self, features, patch_h, patch_w):
+        if len(features) != 4:
+            raise ValueError(f"Factorial decoder requires four features, got {len(features)}")
+        maps = [self._tokens_to_feature_map(tokens, patch_h, patch_w) for tokens in features]
+        if self.projection_mode == "shared":
+            return [self.shared_token_projection(feature) for feature in maps]
+        return [projection(feature) for projection, feature in zip(self.token_projections, maps)]
+
+    def _build_pyramid(self, projected):
+        if len(projected) != 4:
+            raise ValueError(f"Factorial pyramid requires four projected maps, got {len(projected)}")
+        if self.tpa_branches is not None:
+            return tuple(branch(feature) for branch, feature in zip(self.tpa_branches, projected))
+        return (
+            F.interpolate(projected[0], scale_factor=8, mode="bilinear", align_corners=False),
+            F.interpolate(projected[1], scale_factor=4, mode="bilinear", align_corners=False),
+            F.interpolate(projected[2], scale_factor=2, mode="bilinear", align_corners=False),
+            projected[3],
+        )
+
+    def forward(self, features, patch_h, patch_w):
+        projected = self._project_tokens(features, patch_h, patch_w)
+        branch_1, branch_2, branch_3, branch_4 = self._build_pyramid(projected)
+
+        level_1 = self.sad_intra_1(branch_1)
+        level_2 = self.sad_intra_2(branch_2)
+        level_3 = self.sad_intra_3(branch_3)
+        level_4 = self.sad_intra_4(branch_4)
+
+        x4 = self.sad_inter_4(level_4)
+        x3_up = F.interpolate(x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False)
+        x3 = self.sad_inter_3(x3_up + level_3)
+        x2_up = F.interpolate(x3, size=level_2.shape[-2:], mode="bilinear", align_corners=False)
+        x2 = self.sad_inter_2(x2_up + level_2)
+        x1_up = F.interpolate(x2, size=level_1.shape[-2:], mode="bilinear", align_corners=False)
+        x1 = self.sad_inter_1(x1_up + level_1)
+        return self.out_conv(x1)
+
+
+class L12AMSEFDecoder(nn.Module):
+    """Factorial-A's light L12 pyramid with the exact official MSEF consumer.
+
+    The semantic path is the A cell from the L12 factorial: one shared 1x1
+    projection followed by bilinear-only expansion to P2/P4/P8/P16.  The
+    eight ordinary SAD-R blocks are replaced by the unwrapped official MSEF
+    operation.  Construction uses the same fixed per-module seeds as the A
+    cell for the shared projection and output path, but no checkpoint is read.
+    """
+
+    INIT_SEEDS = TPAL12FactorialDecoder.INIT_SEEDS
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__()
+        if len(in_dims) != 4:
+            raise ValueError(f"L12AMSEFDecoder requires four input dims, got {len(in_dims)}")
+        self.decoder_channels = int(decoder_channels)
+        self.projection_mode = "shared"
+        self.use_spatial_conv = False
+        self.shared_token_projection = _construct_with_fixed_seed(
+            lambda: nn.Conv2d(in_dims[0], decoder_channels, 1, bias=False),
+            self.INIT_SEEDS["shared_projection"],
+        )
+        self.token_projections = None
+
+        for name, seed in (
+            ("sad_intra_1", self.INIT_SEEDS["sad_intra_1"]),
+            ("sad_intra_2", self.INIT_SEEDS["sad_intra_2"]),
+            ("sad_intra_3", self.INIT_SEEDS["sad_intra_3"]),
+            ("sad_intra_4", self.INIT_SEEDS["sad_intra_4"]),
+            ("sad_inter_4", self.INIT_SEEDS["sad_inter_4"]),
+            ("sad_inter_3", self.INIT_SEEDS["sad_inter_3"]),
+            ("sad_inter_2", self.INIT_SEEDS["sad_inter_2"]),
+            ("sad_inter_1", self.INIT_SEEDS["sad_inter_1"]),
+        ):
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: OfficialMSEFBlock(decoder_channels, reduction_ratio=16),
+                    seed,
+                ),
+            )
+        self.out_conv = _construct_with_fixed_seed(
+            lambda: nn.Conv2d(decoder_channels, num_classes, 1),
+            self.INIT_SEEDS["out_conv"],
+        )
+
+    @staticmethod
+    def _tokens_to_feature_map(x, patch_h, patch_w):
+        if isinstance(x, (list, tuple)):
+            x = x[0]
+        num_patches = patch_h * patch_w
+        if x.ndim != 3:
+            raise ValueError(f"Expected token tensor with 3 dims, got shape {tuple(x.shape)}")
+        if x.shape[1] < num_patches:
+            raise ValueError(
+                f"Token count {x.shape[1]} is smaller than expected patch grid {num_patches}"
+            )
+        if x.shape[1] != num_patches:
+            x = x[:, -num_patches:, :]
+        return x.transpose(1, 2).reshape(x.shape[0], x.shape[-1], patch_h, patch_w)
+
+    def _project_l12(self, semantic_tokens, patch_h, patch_w):
+        semantic_map = self._tokens_to_feature_map(semantic_tokens, patch_h, patch_w)
+        return self.shared_token_projection(semantic_map)
+
+    @staticmethod
+    def _build_bilinear_pyramid(projected):
+        return (
+            F.interpolate(projected, scale_factor=8, mode="bilinear", align_corners=False),
+            F.interpolate(projected, scale_factor=4, mode="bilinear", align_corners=False),
+            F.interpolate(projected, scale_factor=2, mode="bilinear", align_corners=False),
+            projected,
+        )
+
+    def _forward_msef_sad(self, pyramid):
+        p2, p4, p8, p16 = pyramid
+        level_1 = self.sad_intra_1(p2)
+        level_2 = self.sad_intra_2(p4)
+        level_3 = self.sad_intra_3(p8)
+        level_4 = self.sad_intra_4(p16)
+
+        x4 = self.sad_inter_4(level_4)
+        x3 = self.sad_inter_3(
+            F.interpolate(x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False)
+            + level_3
+        )
+        x2 = self.sad_inter_2(
+            F.interpolate(x3, size=level_2.shape[-2:], mode="bilinear", align_corners=False)
+            + level_2
+        )
+        x1 = self.sad_inter_1(
+            F.interpolate(x2, size=level_1.shape[-2:], mode="bilinear", align_corners=False)
+            + level_1
+        )
+        return self.out_conv(x1)
+
+    def forward(self, features, patch_h, patch_w):
+        if len(features) != 4:
+            raise ValueError(f"L12AMSEFDecoder requires four features, got {len(features)}")
+        projected = self._project_l12(features[-1], patch_h, patch_w)
+        return self._forward_msef_sad(self._build_bilinear_pyramid(projected))
+
+
+class CrossMSEF(nn.Module):
+    """Patch-prescribed Cross-MSEF interaction at one decoder scale.
+
+    It keeps the full spatial feature after the EAG-style enhancement, applies
+    the official MSEF local/channel branches in the 64-dimensional latent
+    space, and injects the resulting 256-channel residual with a zero scalar
+    gamma.  There is no attention matrix, extra normalization, or post-EAG
+    ECA/SA path.
+    """
+
+    def __init__(self, semantic_channels=256, spatial_channels=32, interaction_dim=64):
+        super().__init__()
+        semantic_channels = int(semantic_channels)
+        spatial_channels = int(spatial_channels)
+        interaction_dim = int(interaction_dim)
+        if interaction_dim % 32 != 0:
+            raise ValueError("Cross-MSEF interaction_dim must be divisible by groups=32")
+        self.semantic_channels = semantic_channels
+        self.spatial_channels = spatial_channels
+        self.interaction_dim = interaction_dim
+
+        self.semantic_projection = nn.Conv2d(
+            semantic_channels, interaction_dim, kernel_size=1, bias=False
+        )
+        self.spatial_projection = nn.Conv2d(
+            spatial_channels, interaction_dim, kernel_size=1, bias=False
+        )
+
+        self.semantic_guide = nn.Sequential(
+            nn.Conv2d(
+                interaction_dim,
+                interaction_dim,
+                kernel_size=1,
+                groups=32,
+                bias=False,
+            ),
+            nn.BatchNorm2d(interaction_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.spatial_guide = nn.Sequential(
+            nn.Conv2d(
+                interaction_dim,
+                interaction_dim,
+                kernel_size=1,
+                groups=32,
+                bias=False,
+            ),
+            nn.BatchNorm2d(interaction_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(interaction_dim, 1, kernel_size=1, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid(),
+        )
+
+        self.spatial_norm = nn.LayerNorm(interaction_dim)
+        self.spatial_depthwise = nn.Conv2d(
+            interaction_dim,
+            interaction_dim,
+            kernel_size=3,
+            padding=1,
+            groups=interaction_dim,
+            bias=True,
+        )
+        self.semantic_norm = nn.LayerNorm(interaction_dim)
+        hidden = max(1, interaction_dim // 16)
+        self.se_fc1 = nn.Linear(interaction_dim, hidden)
+        self.se_fc2 = nn.Linear(hidden, interaction_dim)
+        self.delta_projection = nn.Conv2d(
+            interaction_dim, semantic_channels, kernel_size=1, bias=False
+        )
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    @staticmethod
+    def _channel_layer_norm(x, norm):
+        return norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+    def forward(self, semantic_feature, spatial_feature):
+        if semantic_feature.ndim != 4 or spatial_feature.ndim != 4:
+            raise ValueError("Cross-MSEF expects BCHW semantic and spatial features")
+        if semantic_feature.shape[0] != spatial_feature.shape[0]:
+            raise ValueError("Cross-MSEF batch sizes do not match")
+        if semantic_feature.shape[-2:] != spatial_feature.shape[-2:]:
+            raise ValueError(
+                "Cross-MSEF semantic/spatial resolutions do not match: "
+                f"{tuple(semantic_feature.shape[-2:])} vs {tuple(spatial_feature.shape[-2:])}"
+            )
+
+        p = self.semantic_projection(semantic_feature)
+        s = self.spatial_projection(spatial_feature)
+
+        pg = self.semantic_guide(p)
+        sg = self.spatial_guide(s)
+        a = F.relu(pg + sg, inplace=False)
+        psi = self.psi(a)
+        s_hat = s * psi + s
+
+        zs = self._channel_layer_norm(s_hat, self.spatial_norm)
+        local = self.spatial_depthwise(zs)
+
+        zp = self._channel_layer_norm(p, self.semantic_norm)
+        pooled = F.adaptive_avg_pool2d(zp, output_size=1).flatten(1)
+        channel_weight = torch.tanh(self.se_fc2(F.relu(self.se_fc1(pooled))))
+        channel_weight = channel_weight.view(p.shape[0], self.interaction_dim, 1, 1)
+        channel_feature = zp * channel_weight
+
+        delta64 = local * channel_feature
+        delta256 = self.delta_projection(delta64)
+        return semantic_feature + self.gamma * delta256
+
+
+class L12ACrossMSEFDecoder(L12AMSEFDecoder):
+    """EXP-2: A-MSEF plus RGB Lite-SPM Cross-MSEF at P2/P4/P8."""
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed Cross-MSEF experiment requires decoder_channels=256")
+        self.cross_msef_2 = _construct_with_fixed_seed(
+            lambda: CrossMSEF(256, 32, 64), 45002
+        )
+        self.cross_msef_4 = _construct_with_fixed_seed(
+            lambda: CrossMSEF(256, 64, 64), 45004
+        )
+        self.cross_msef_8 = _construct_with_fixed_seed(
+            lambda: CrossMSEF(256, 128, 64), 45008
+        )
+
+    def forward(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        if len(spatial_features) != 3:
+            raise ValueError(f"Cross-MSEF requires D2/D4/D8, got {len(spatial_features)} maps")
+        projected = self._project_l12(semantic_tokens, patch_h, patch_w)
+        p2, p4, p8, p16 = self._build_bilinear_pyramid(projected)
+        p2 = self.cross_msef_2(p2, spatial_features[0])
+        p4 = self.cross_msef_4(p4, spatial_features[1])
+        p8 = self.cross_msef_8(p8, spatial_features[2])
+        return self._forward_msef_sad((p2, p4, p8, p16))
+
+
+class L12ACrossEEBaseDecoder(L12ACrossMSEFDecoder):
+    """Cross-MSEF front-end with a uniform eight-position EE-family SAD.
+
+    The inherited L12 semantic pyramid, RGB Lite-SPM, and three Cross-MSEF
+    modules are unchanged.  Only the eight actual SAD consumer blocks are
+    replaced.  Both variants use the same fixed constructor seeds, so the
+    EE-versus-Signed-EE comparison changes only the pointwise activation.
+    """
+
+    EE_SEEDS = {
+        "sad_intra_1": 49001,
+        "sad_intra_2": 49002,
+        "sad_intra_3": 49003,
+        "sad_intra_4": 49004,
+        "sad_inter_4": 49005,
+        "sad_inter_3": 49006,
+        "sad_inter_2": 49007,
+        "sad_inter_1": 49008,
+    }
+
+    def __init__(
+        self,
+        in_dims,
+        decoder_channels=256,
+        num_classes=4,
+        edge_activation="sigmoid",
+    ):
+        super().__init__(
+            in_dims,
+            decoder_channels=decoder_channels,
+            num_classes=num_classes,
+        )
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed EE experiment requires decoder_channels=256")
+        edge_activation = str(edge_activation).lower()
+        if edge_activation not in {"sigmoid", "tanh"}:
+            raise ValueError(f"Unsupported EE activation: {edge_activation}")
+        self.edge_activation = edge_activation
+        for name, seed in self.EE_SEEDS.items():
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: EdgeEnhancerBlock(
+                        decoder_channels,
+                        activation=edge_activation,
+                        groups=32,
+                        count_include_pad=False,
+                    ),
+                    seed,
+                ),
+            )
+
+
+class L12ACrossRDecoder(L12ACrossMSEFDecoder):
+    """A + RGB Lite-SPM Cross-MSEF with the original SAD-R blocks.
+
+    This is the missing causal control for the Cross-MSEF experiment. The
+    L12 shared projection, bilinear semantic pyramid, RGB Lite-SPM, and the
+    three Cross-MSEF modules are inherited unchanged. Only the eight SAD
+    consumer blocks are replaced with the original ResidualDepthwiseBlock.
+    """
+
+    R_SEEDS = {
+        "sad_intra_1": 43001,
+        "sad_intra_2": 43002,
+        "sad_intra_3": 43003,
+        "sad_intra_4": 43004,
+        "sad_inter_4": 43005,
+        "sad_inter_3": 43006,
+        "sad_inter_2": 43007,
+        "sad_inter_1": 43008,
+    }
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed Cross-R control requires decoder_channels=256")
+        for name, seed in self.R_SEEDS.items():
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: ResidualDepthwiseBlock(
+                        decoder_channels, use_group_norm=True
+                    ),
+                    seed,
+                ),
+            )
+
+
+class OfficialDySample(nn.Module):
+    """Official DySample operator kept local to the OSD runner.
+
+    This follows the authors' released implementation: feature-conditioned
+    offsets are converted to sampling grids and applied with ``grid_sample``.
+    The OSD diagnostic uses the released DySample-S+ setting
+    (``style='pl'``, ``groups=8``, ``dyscope=True``, ``scale=2``).
+    """
+
+    def __init__(self, in_channels, scale=2, style="lp", groups=4, dyscope=False):
+        super().__init__()
+        self.scale = int(scale)
+        self.style = str(style)
+        self.groups = int(groups)
+        if self.style not in {"lp", "pl"}:
+            raise ValueError(f"Unsupported DySample style={self.style!r}")
+        if self.style == "pl":
+            if in_channels < self.scale ** 2 or in_channels % (self.scale ** 2) != 0:
+                raise ValueError("DySample PL requires channels divisible by scale^2")
+        if in_channels < self.groups or in_channels % self.groups != 0:
+            raise ValueError("DySample requires channels divisible by groups")
+
+        offset_in_channels = int(in_channels)
+        if self.style == "pl":
+            offset_in_channels //= self.scale ** 2
+            out_channels = 2 * self.groups
+        else:
+            out_channels = 2 * self.groups * self.scale ** 2
+
+        self.offset = nn.Conv2d(offset_in_channels, out_channels, 1)
+        nn.init.normal_(self.offset.weight, mean=0.0, std=0.001)
+        nn.init.constant_(self.offset.bias, 0.0)
+        if dyscope:
+            self.scope = nn.Conv2d(offset_in_channels, out_channels, 1, bias=False)
+            nn.init.constant_(self.scope.weight, 0.0)
+
+        self.register_buffer("init_pos", self._init_pos())
+
+    def _init_pos(self):
+        h = torch.arange(
+            (-self.scale + 1) / 2,
+            (self.scale - 1) / 2 + 1,
+        ) / self.scale
+        return (
+            torch.stack(torch.meshgrid([h, h]))
+            .transpose(1, 2)
+            .repeat(1, self.groups, 1)
+            .reshape(1, -1, 1, 1)
+        )
+
+    def sample(self, x, offset):
+        batch, _, height, width = offset.shape
+        offset = offset.view(batch, 2, -1, height, width)
+        coords_h = torch.arange(height, device=x.device, dtype=x.dtype) + 0.5
+        coords_w = torch.arange(width, device=x.device, dtype=x.dtype) + 0.5
+        coords = (
+            torch.stack(torch.meshgrid([coords_w, coords_h]))
+            .transpose(1, 2)
+            .unsqueeze(1)
+            .unsqueeze(0)
+        )
+        normalizer = torch.tensor(
+            [width, height], dtype=x.dtype, device=x.device
+        ).view(1, 2, 1, 1, 1)
+        coords = 2 * (coords + offset) / normalizer - 1
+        coords = (
+            F.pixel_shuffle(coords.view(batch, -1, height, width), self.scale)
+            .view(batch, 2, -1, self.scale * height, self.scale * width)
+            .permute(0, 2, 3, 4, 1)
+            .contiguous()
+            .flatten(0, 1)
+        )
+        return F.grid_sample(
+            x.reshape(batch * self.groups, -1, height, width),
+            coords,
+            mode="bilinear",
+            align_corners=False,
+            padding_mode="border",
+        ).view(batch, -1, self.scale * height, self.scale * width)
+
+    def forward_lp(self, x):
+        if hasattr(self, "scope"):
+            offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
+        else:
+            offset = self.offset(x) * 0.25 + self.init_pos
+        return self.sample(x, offset)
+
+    def forward_pl(self, x):
+        x_ = F.pixel_shuffle(x, self.scale)
+        if hasattr(self, "scope"):
+            offset = (
+                F.pixel_unshuffle(
+                    self.offset(x_) * self.scope(x_).sigmoid(), self.scale
+                )
+                * 0.5
+                + self.init_pos
+            )
+        else:
+            offset = F.pixel_unshuffle(self.offset(x_), self.scale) * 0.25 + self.init_pos
+        return self.sample(x, offset)
+
+    def forward(self, x):
+        if self.style == "pl":
+            return self.forward_pl(x)
+        return self.forward_lp(x)
+
+
+class L12ACrossWeightedRDecoder(L12ACrossRDecoder):
+    """Cross-R with zero-initialized scalar weights for P+Up fusion."""
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("Weighted Cross-R requires decoder_channels=256")
+        # 2*softmax(theta) gives [1, 1] at theta=[0, 0], exactly preserving
+        # the historical unweighted P+Up operation at initialization.
+        self.fusion_logits = nn.Parameter(torch.zeros(3, 2))
+
+    def _fusion_weights(self, index):
+        return 2.0 * F.softmax(self.fusion_logits[index], dim=0)
+
+    def forward(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        if len(spatial_features) != 3:
+            raise ValueError(
+                f"Weighted Cross-R requires D2/D4/D8, got {len(spatial_features)} maps"
+            )
+        projected = self._project_l12(semantic_tokens, patch_h, patch_w)
+        p2, p4, p8, p16 = self._build_bilinear_pyramid(projected)
+        p2 = self.cross_msef_2(p2, spatial_features[0])
+        p4 = self.cross_msef_4(p4, spatial_features[1])
+        p8 = self.cross_msef_8(p8, spatial_features[2])
+
+        level_1 = self.sad_intra_1(p2)
+        level_2 = self.sad_intra_2(p4)
+        level_3 = self.sad_intra_3(p8)
+        level_4 = self.sad_intra_4(p16)
+        x4 = self.sad_inter_4(level_4)
+
+        w8 = self._fusion_weights(0)
+        x3_up = F.interpolate(x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False)
+        x3 = self.sad_inter_3(w8[0] * level_3 + w8[1] * x3_up)
+
+        w4 = self._fusion_weights(1)
+        x2_up = F.interpolate(x3, size=level_2.shape[-2:], mode="bilinear", align_corners=False)
+        x2 = self.sad_inter_2(w4[0] * level_2 + w4[1] * x2_up)
+
+        w2 = self._fusion_weights(2)
+        x1_up = F.interpolate(x2, size=level_1.shape[-2:], mode="bilinear", align_corners=False)
+        x1 = self.sad_inter_1(w2[0] * level_1 + w2[1] * x1_up)
+        return self.out_conv(x1)
+
+
+class L12ACrossDySampleRDecoder(L12ACrossRDecoder):
+    """Cross-R with official DySample-S+ at the three inter upsampling sites."""
+
+    DYSAMPLE_SEEDS = {
+        "dysample_p8": 52008,
+        "dysample_p4": 52004,
+        "dysample_p2": 52002,
+    }
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("DySample Cross-R requires decoder_channels=256")
+        for name, seed in self.DYSAMPLE_SEEDS.items():
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: OfficialDySample(
+                        decoder_channels,
+                        scale=2,
+                        style="pl",
+                        groups=8,
+                        dyscope=True,
+                    ),
+                    seed,
+                ),
+            )
+
+    def forward(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        if len(spatial_features) != 3:
+            raise ValueError(
+                f"DySample Cross-R requires D2/D4/D8, got {len(spatial_features)} maps"
+            )
+        projected = self._project_l12(semantic_tokens, patch_h, patch_w)
+        p2, p4, p8, p16 = self._build_bilinear_pyramid(projected)
+        p2 = self.cross_msef_2(p2, spatial_features[0])
+        p4 = self.cross_msef_4(p4, spatial_features[1])
+        p8 = self.cross_msef_8(p8, spatial_features[2])
+
+        level_1 = self.sad_intra_1(p2)
+        level_2 = self.sad_intra_2(p4)
+        level_3 = self.sad_intra_3(p8)
+        level_4 = self.sad_intra_4(p16)
+        x4 = self.sad_inter_4(level_4)
+        x3 = self.sad_inter_3(self.dysample_p8(x4) + level_3)
+        x2 = self.sad_inter_2(self.dysample_p4(x3) + level_2)
+        x1 = self.sad_inter_1(self.dysample_p2(x2) + level_1)
+        return self.out_conv(x1)
+
+
+class L12ACDRDecoder(L12ACrossMSEFDecoder):
+    """Cross-MSEF front-end with one uniform CDR block at all SAD positions."""
+
+    CDR_SEEDS = {
+        "sad_intra_1": 47001,
+        "sad_intra_2": 47002,
+        "sad_intra_3": 47003,
+        "sad_intra_4": 47004,
+        "sad_inter_4": 47005,
+        "sad_inter_3": 47006,
+        "sad_inter_2": 47007,
+        "sad_inter_1": 47008,
+    }
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed CDR experiment requires decoder_channels=256")
+        for name, seed in self.CDR_SEEDS.items():
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: CDRBlock(decoder_channels, groups=32), seed
+                ),
+            )
+
+    def _cross_pyramid(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        if len(spatial_features) != 3:
+            raise ValueError(f"CDR requires D2/D4/D8, got {len(spatial_features)} maps")
+        projected = self._project_l12(semantic_tokens, patch_h, patch_w)
+        p2, p4, p8, p16 = self._build_bilinear_pyramid(projected)
+        p2 = self.cross_msef_2(p2, spatial_features[0])
+        p4 = self.cross_msef_4(p4, spatial_features[1])
+        p8 = self.cross_msef_8(p8, spatial_features[2])
+        return p2, p4, p8, p16
+
+    def _forward_cdr_sad(self, pyramid, return_trace=False):
+        p2, p4, p8, p16 = pyramid
+        if not return_trace:
+            # The diagnostic trace contains several full-resolution tensors at
+            # P2/P4.  Do not materialize or retain it during ordinary training
+            # and inference; otherwise all eight block traces stay alive until
+            # this whole SAD forward returns.  The numerical path below is
+            # identical to the traced path.
+            level_1 = self.sad_intra_1(p2)
+            level_2 = self.sad_intra_2(p4)
+            level_3 = self.sad_intra_3(p8)
+            level_4 = self.sad_intra_4(p16)
+            x4 = self.sad_inter_4(level_4)
+            x3 = self.sad_inter_3(
+                F.interpolate(x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False)
+                + level_3
+            )
+            x2 = self.sad_inter_2(
+                F.interpolate(x3, size=level_2.shape[-2:], mode="bilinear", align_corners=False)
+                + level_2
+            )
+            x1 = self.sad_inter_1(
+                F.interpolate(x2, size=level_1.shape[-2:], mode="bilinear", align_corners=False)
+                + level_1
+            )
+            return self.out_conv(x1)
+
+        level_1, trace_1 = self.sad_intra_1.forward_with_trace(p2)
+        level_2, trace_2 = self.sad_intra_2.forward_with_trace(p4)
+        level_3, trace_3 = self.sad_intra_3.forward_with_trace(p8)
+        level_4, trace_4 = self.sad_intra_4.forward_with_trace(p16)
+
+        x4, trace_5 = self.sad_inter_4.forward_with_trace(level_4)
+        x3_input = F.interpolate(
+            x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False
+        ) + level_3
+        x3, trace_6 = self.sad_inter_3.forward_with_trace(x3_input)
+        x2_input = F.interpolate(
+            x3, size=level_2.shape[-2:], mode="bilinear", align_corners=False
+        ) + level_2
+        x2, trace_7 = self.sad_inter_2.forward_with_trace(x2_input)
+        x1_input = F.interpolate(
+            x2, size=level_1.shape[-2:], mode="bilinear", align_corners=False
+        ) + level_1
+        x1, trace_8 = self.sad_inter_1.forward_with_trace(x1_input)
+        logits = self.out_conv(x1)
+        if not return_trace:
+            return logits
+        traces = {
+            "sad_intra_1": trace_1,
+            "sad_intra_2": trace_2,
+            "sad_intra_3": trace_3,
+            "sad_intra_4": trace_4,
+            "sad_inter_4": trace_5,
+            "sad_inter_3": trace_6,
+            "sad_inter_2": trace_7,
+            "sad_inter_1": trace_8,
+        }
+        return logits, traces
+
+    def forward(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        pyramid = self._cross_pyramid(semantic_tokens, spatial_features, patch_h, patch_w)
+        return self._forward_cdr_sad(pyramid)
+
+    def forward_with_diagnostics(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        pyramid = self._cross_pyramid(semantic_tokens, spatial_features, patch_h, patch_w)
+        return self._forward_cdr_sad(pyramid, return_trace=True)
+
+
+class L12ACrossMSEFDeepSupervisionDecoder(L12ACrossMSEFDecoder):
+    """Cross-MSEF baseline with auxiliary CE heads on inter3/inter2/inter1."""
+
+    AUX_HEAD_SEEDS = {
+        "aux_inter3": 48001,
+        "aux_inter2": 48002,
+        "aux_inter1": 48003,
+    }
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed deep-supervision experiment requires decoder_channels=256")
+        for name, seed in self.AUX_HEAD_SEEDS.items():
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: nn.Conv2d(decoder_channels, num_classes, 1), seed
+                ),
+            )
+
+    def _forward_msef_sad_with_aux(self, pyramid):
+        p2, p4, p8, p16 = pyramid
+        level_1 = self.sad_intra_1(p2)
+        level_2 = self.sad_intra_2(p4)
+        level_3 = self.sad_intra_3(p8)
+        level_4 = self.sad_intra_4(p16)
+
+        x4 = self.sad_inter_4(level_4)
+        x3 = self.sad_inter_3(
+            F.interpolate(x4, size=level_3.shape[-2:], mode="bilinear", align_corners=False)
+            + level_3
+        )
+        x2 = self.sad_inter_2(
+            F.interpolate(x3, size=level_2.shape[-2:], mode="bilinear", align_corners=False)
+            + level_2
+        )
+        x1 = self.sad_inter_1(
+            F.interpolate(x2, size=level_1.shape[-2:], mode="bilinear", align_corners=False)
+            + level_1
+        )
+        return self.out_conv(x1), (
+            self.aux_inter3(x3),
+            self.aux_inter2(x2),
+            self.aux_inter1(x1),
+        )
+
+    def forward_with_aux(self, semantic_tokens, spatial_features, patch_h, patch_w):
+        if len(spatial_features) != 3:
+            raise ValueError(f"Deep supervision requires D2/D4/D8, got {len(spatial_features)} maps")
+        projected = self._project_l12(semantic_tokens, patch_h, patch_w)
+        p2, p4, p8, p16 = self._build_bilinear_pyramid(projected)
+        p2 = self.cross_msef_2(p2, spatial_features[0])
+        p4 = self.cross_msef_4(p4, spatial_features[1])
+        p8 = self.cross_msef_8(p8, spatial_features[2])
+        return self._forward_msef_sad_with_aux((p2, p4, p8, p16))
 
 
 class TPASADMSEFDecoder(TPASADDecoder):
@@ -1894,14 +3004,28 @@ class DPT(nn.Module):
             "spm_ccfm_sad",
             "spm_ccfm_ms_mlp",
             "spm_sad",
+            "tpa_l12_shared_bilinear",
+            "tpa_l12_shared_conv",
+            "tpa_l12_independent_bilinear",
+            "tpa_l12_independent_conv",
+            "l12_a_msef",
+            "l12_a_cross_msef",
+            "l12_a_cross_r",
+            "l12_a_cross_msef_cdr",
+            "l12_a_cross_msef_ds",
+            "l12_a_cross_ee",
+            "l12_a_cross_see",
+            "l12_a_cross_r_weighted",
+            "l12_a_cross_r_dysample_splus",
         }:
             raise ValueError(
                 f"Unknown decoder_variant '{self.decoder_variant}'. "
                 "Expected 'tpa_sad', 'tpa_sad_msef', 'tpa_ms_mlp', 'dpa_ms_mlp', "
                 "'tpa_change_cascade', "
                 "'tpa_sad_base', 'dpa_sad_base', 'patch_dpa_shared', "
-                "'patch_dpa_independent', 'patch_guided_sad', 'ltp_cli', 'semantic_spatial', or "
-                "'mlp_same_scale', 'spm_ccfm_sad', 'spm_ccfm_ms_mlp', or 'spm_sad'."
+                "'patch_dpa_independent', 'patch_guided_sad', 'ltp_cli', 'semantic_spatial', "
+                "'mlp_same_scale', 'spm_ccfm_sad', 'spm_ccfm_ms_mlp', 'spm_sad', or "
+                "an L12 factorial/MSEF variant."
             )
         if self.decoder_variant in {"semantic_spatial", "mlp_same_scale"}:
             if self.layer_mapping is not None:
@@ -1967,10 +3091,22 @@ class DPT(nn.Module):
                 )
             if self.wcf_enabled or adaptive_readout:
                 raise ValueError(f"{self.decoder_variant} cannot combine WCF or ALSR")
+        if self.decoder_variant == "l12_a_msef":
+            if self.layer_mapping != [3, 3, 3, 3]:
+                raise ValueError(
+                    "l12_a_msef requires factorial-A routing layer_mapping=[3,3,3,3]"
+                )
+            if self.wcf_enabled or adaptive_readout:
+                raise ValueError("l12_a_msef cannot combine WCF or ALSR")
+        if self.decoder_variant in CROSS_MSEF_VARIANTS:
+            if self.layer_mapping is not None:
+                raise ValueError(f"{self.decoder_variant} uses the single final semantic source and requires layer_mapping=null")
+            if self.wcf_enabled or adaptive_readout:
+                raise ValueError(f"{self.decoder_variant} cannot combine WCF or ALSR")
         self.in_dims = [self.backbone.embed_dim] * 4
         self.spm_stem = (
             LiteSpatialPriorStem(in_channels=3, channels=(32, 64, 128))
-            if self.decoder_variant in SPM_VARIANTS
+            if self.decoder_variant in (SPM_VARIANTS | CROSS_MSEF_VARIANTS)
             else None
         )
         self.wcf_blocks = nn.ModuleList(
@@ -2091,6 +3227,86 @@ class DPT(nn.Module):
                 num_classes=self.nclass,
                 use_group_norm=not use_bn,
             )
+        elif self.decoder_variant in {
+            "tpa_l12_shared_bilinear",
+            "tpa_l12_shared_conv",
+            "tpa_l12_independent_bilinear",
+            "tpa_l12_independent_conv",
+        }:
+            self.decoder = TPAL12FactorialDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+                use_group_norm=not use_bn,
+                projection_mode=(
+                    "shared"
+                    if self.decoder_variant in {
+                        "tpa_l12_shared_bilinear",
+                        "tpa_l12_shared_conv",
+                    }
+                    else "independent"
+                ),
+                use_spatial_conv=self.decoder_variant in {
+                    "tpa_l12_shared_conv",
+                    "tpa_l12_independent_conv",
+                },
+            )
+        elif self.decoder_variant == "l12_a_msef":
+            self.decoder = L12AMSEFDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_msef":
+            self.decoder = L12ACrossMSEFDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_r":
+            self.decoder = L12ACrossRDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_r_weighted":
+            self.decoder = L12ACrossWeightedRDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_r_dysample_splus":
+            self.decoder = L12ACrossDySampleRDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_msef_cdr":
+            self.decoder = L12ACDRDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_msef_ds":
+            self.decoder = L12ACrossMSEFDeepSupervisionDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_ee":
+            self.decoder = L12ACrossEEBaseDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+                edge_activation="sigmoid",
+            )
+        elif self.decoder_variant == "l12_a_cross_see":
+            self.decoder = L12ACrossEEBaseDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+                edge_activation="tanh",
+            )
         else:
             self.decoder = SameScaleMLPDecoder(
                 backbone_channels=self.backbone.embed_dim,
@@ -2184,7 +3400,27 @@ class DPT(nn.Module):
         patch_h, patch_w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         patch_embedding = None
         wcf_gates = []
-        if self.decoder_variant in SPM_VARIANTS:
+        if self.decoder_variant in CROSS_MSEF_VARIANTS:
+            final_layer_idx = self.intermediate_layer_idx[self.encoder_size][-1]
+            if self._backbone_locked:
+                with torch.no_grad():
+                    semantic_features = self.backbone.get_intermediate_layers(
+                        x, n=[final_layer_idx]
+                    )
+            else:
+                semantic_features = self.backbone.get_intermediate_layers(
+                    x, n=[final_layer_idx]
+                )
+            semantic_tokens = semantic_features[-1]
+            spatial_features = self.spm_stem(x)
+            out = self.decoder(
+                semantic_tokens,
+                spatial_features,
+                patch_h,
+                patch_w,
+            )
+            returned_feature = semantic_tokens
+        elif self.decoder_variant in SPM_VARIANTS:
             final_layer_idx = self.intermediate_layer_idx[self.encoder_size][-1]
             if self._backbone_locked:
                 with torch.no_grad():
@@ -2230,7 +3466,9 @@ class DPT(nn.Module):
             if self.decoder_variant in PATCH_PRIOR_VARIANTS:
                 patch_embedding = self._raw_patch_embedding(x)
 
-        if self.decoder_variant not in (SPM_VARIANTS | {"semantic_spatial"}):
+        if self.decoder_variant not in (
+            SPM_VARIANTS | {"semantic_spatial"} | CROSS_MSEF_VARIANTS
+        ):
             if self.wcf_enabled:
                 anchor = feats[-1]
                 supplemented = []
@@ -2255,6 +3493,47 @@ class DPT(nn.Module):
         if return_feats:
             return out, returned_feature
         return out
+
+    def forward_with_aux(self, x):
+        """Return final and auxiliary logits for the DS-only experiment.
+
+        The ordinary ``forward`` remains inference-compatible and returns only
+        the final logits.  Auxiliary heads are attached after inter3, inter2,
+        and inter1 inside the Cross-MSEF SAD decoder and are used only by the
+        training runner.
+        """
+        if self.decoder_variant not in DEEP_SUPERVISION_VARIANTS:
+            raise RuntimeError(
+                "forward_with_aux is only available for the deep-supervision variant"
+            )
+        patch_h, patch_w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
+        final_layer_idx = self.intermediate_layer_idx[self.encoder_size][-1]
+        if self._backbone_locked:
+            with torch.no_grad():
+                semantic_features = self.backbone.get_intermediate_layers(
+                    x, n=[final_layer_idx]
+                )
+        else:
+            semantic_features = self.backbone.get_intermediate_layers(
+                x, n=[final_layer_idx]
+            )
+        semantic_tokens = semantic_features[-1]
+        spatial_features = self.spm_stem(x)
+        lowres_logits, lowres_aux = self.decoder.forward_with_aux(
+            semantic_tokens,
+            spatial_features,
+            patch_h,
+            patch_w,
+        )
+        output_size = x.shape[-2:]
+        final_logits = F.interpolate(
+            lowres_logits, size=output_size, mode="bilinear", align_corners=False
+        )
+        aux_logits = tuple(
+            F.interpolate(aux, size=output_size, mode="bilinear", align_corners=False)
+            for aux in lowres_aux
+        )
+        return final_logits, aux_logits
 
     def dpa_diagnostics(self, x):
         """Run the DPA path and return logits plus detached-path diagnostics.
