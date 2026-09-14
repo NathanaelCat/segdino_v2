@@ -92,7 +92,9 @@ def _logits_for_alphas(path, alphas, output_size):
     decoder = path["decoder"]
     a8, a4, a2 = [float(value) for value in alphas]
     x3 = decoder.sad_inter_3(path["level_3"] + a8 * path["u8"])
-    if a4 == 1.0:
+    # The cached normal u4 is valid only when P8 also stayed at alpha=1.
+    # If P8 changes, its new x3 must be propagated through the P4 merge.
+    if a4 == 1.0 and a8 == 1.0:
         u4 = path["u4_normal"]
     else:
         u4 = F.interpolate(x3, size=path["level_2"].shape[-2:], mode="bilinear", align_corners=False)
