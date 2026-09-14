@@ -201,6 +201,47 @@ def _summarize_ltp_cli_gammas(model: nn.Module) -> dict[str, float]:
     }
 
 
+def _spsr_learning_alive(event: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Apply the explicit early gate to the SPSR learning monitor.
+
+    ``gamma`` is zero-initialized, so the first backward is expected to open
+    only gamma.  By the gate step, at least one of the offset or compatibility
+    statistics must have moved beyond numerical initialization and their
+    gradients must remain finite/non-zero.  This is a conservative diagnostic
+    gate, not a performance-based early-stopping rule.
+    """
+    gammas = [float(value) for value in event.get("gamma_after_step", [])]
+    scales = event.get("scales", [])
+    gradients = event.get("gradients_before_step", {})
+    finite_gradients = all(np.isfinite(float(value)) for value in gradients.values())
+    max_grad = max((abs(float(value)) for value in gradients.values()), default=0.0)
+    max_gamma = max((abs(value) for value in gammas), default=0.0)
+    max_offset = max(
+        (abs(float(scale.get("offset_abs_max_source_tokens", 0.0))) for scale in scales),
+        default=0.0,
+    )
+    max_weight_delta = max(
+        (
+            abs(float(scale.get("weight_abs_deviation_from_uniform_mean", 0.0)))
+            for scale in scales
+        ),
+        default=0.0,
+    )
+    checks = {
+        "gamma_moved": max_gamma > 1e-7,
+        "offset_or_weight_moved": max_offset > 1e-6 or max_weight_delta > 1e-7,
+        "branch_gradients_finite": finite_gradients,
+        "branch_gradient_nonzero": max_grad > 0.0,
+    }
+    return all(checks.values()), {
+        "checks": checks,
+        "max_abs_gamma_after_step": max_gamma,
+        "max_abs_offset_source_tokens": max_offset,
+        "max_weight_deviation_from_uniform_mean": max_weight_delta,
+        "max_branch_gradient_norm": max_grad,
+    }
+
+
 def _seed_everything(seed: int, deterministic: bool, cudnn_benchmark: bool) -> None:
     if deterministic and cudnn_benchmark:
         raise ValueError("deterministic=True and cudnn_benchmark=True are contradictory")
@@ -495,6 +536,11 @@ def run(
     freeze_backbone = bool(model_config.get("freeze_backbone", True))
     if freeze_backbone:
         model.lock_backbone()
+    spsr_enabled = model_cfg.decoder_variant == "l12_spsr_ms_mlp"
+    if spsr_enabled:
+        # The SPSR monitor is detached scalar bookkeeping only; it does not
+        # change the forward graph or the optimization objective.
+        model.set_spsr_monitor(True)
     init_checkpoint_info = None
     if init_checkpoint is not None:
         init_checkpoint_info = _load_init_checkpoint(model, _resolve_path(init_checkpoint))
@@ -794,6 +840,12 @@ def run(
     val_interval = 1 if smoke else int(val_interval)
     max_eval_batches = 1 if smoke else training.get("max_eval_batches")
     history: list[dict[str, Any]] = []
+    spsr_monitor_history: list[dict[str, Any]] = []
+    spsr_gate_step = int(training.get("spsr_learning_gate_step", 500))
+    spsr_monitor_interval = int(training.get("spsr_monitor_interval_steps", 50))
+    spsr_gate_passed = None
+    spsr_stopped_early = False
+    spsr_stop_reason = None
     best_value = float("-inf")
     best_routing_weights = None
     best_dpa_stats = None
@@ -852,12 +904,41 @@ def run(
                             f"Aux output/target shape mismatch: {aux.shape} vs {targets.shape}"
                         )
         if amp_enabled:
+            spsr_event = model.get_spsr_learning_snapshot() if spsr_enabled else None
             scaler.scale(loss).backward()
+            if spsr_enabled:
+                # The snapshot is produced by the forward pass, while the
+                # gradients are read immediately after backward below.
+                spsr_event = model.get_spsr_learning_snapshot()
             scaler.step(optimizer)
             scaler.update()
         else:
             loss.backward()
+            spsr_event = model.get_spsr_learning_snapshot() if spsr_enabled else None
             optimizer.step()
+        if spsr_enabled and spsr_event is not None:
+            spsr_event = dict(spsr_event)
+            spsr_event["step"] = step
+            spsr_event["gamma_after_step"] = [
+                float(value.detach().float().item())
+                for value in model.decoder.gammas
+            ]
+            if step == 1 or step % max(1, spsr_monitor_interval) == 0 or step == spsr_gate_step:
+                spsr_monitor_history.append(spsr_event)
+            if step == spsr_gate_step:
+                spsr_gate_passed, gate_summary = _spsr_learning_alive(spsr_event)
+                log_print(
+                    f"SPSR learning-alive gate step={step} "
+                    f"passed={spsr_gate_passed} details={json.dumps(gate_summary, sort_keys=True)}"
+                )
+                if not spsr_gate_passed:
+                    spsr_stopped_early = True
+                    spsr_stop_reason = (
+                        "SPSR branches remained inactive at the configured "
+                        f"{spsr_gate_step}-step learning-alive gate"
+                    )
+                    log_print(f"SPSR early stop: {spsr_stop_reason}")
+                    break
         if lr_scheduler is not None:
             lr_scheduler.step()
 
@@ -1033,6 +1114,11 @@ def run(
         "selection_split": selection_split,
         "best_checkpoint": str(best_path) if best_path.exists() else None,
         "latest_checkpoint": str(latest_path) if latest_path.exists() else None,
+        "spsr_learning_gate_step": spsr_gate_step if spsr_enabled else None,
+        "spsr_learning_gate_passed": spsr_gate_passed if spsr_enabled else None,
+        "spsr_stopped_early": spsr_stopped_early,
+        "spsr_stop_reason": spsr_stop_reason,
+        "spsr_monitor_trajectory": spsr_monitor_history if spsr_enabled else None,
         "params_total": total_params,
         "params_backbone": backbone_params,
         "params_decoder": decoder_params,
