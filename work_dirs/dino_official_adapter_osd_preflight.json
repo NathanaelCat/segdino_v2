@@ -1,0 +1,152 @@
+{
+  "current_branch": "feat/osd-semantic-spatial-decoupling",
+  "current_commit": "a3e3b603e76104cb7c3c0f06b3071f60fc623549",
+  "model": "DINO-OFFICIAL-ADAPTER-OSD-001",
+  "decoder_variant": "dinov3_adapter",
+  "device": "cuda:1",
+  "input_shape": [
+    1,
+    3,
+    512,
+    512
+  ],
+  "validation_sample": "Oil (1008)",
+  "official_dinov3_repo": "/home/zhengshijie/workspace/Project2/dinov3",
+  "official_dinov3_repo_commit": "e15096ba52212af8dfd95ef0d0bf4c1ce3b02526",
+  "dino_checkpoint": "/home/zhengshijie/workspace/Project2/weights/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+  "dino_checkpoint_sha256": "08c60483bc63c04f533611e34bf70b120eedb7240f469bc16e9e20bf344b941d",
+  "official_interaction_indexes_zero_based": [
+    2,
+    5,
+    8,
+    11
+  ],
+  "official_interaction_names": [
+    "L3",
+    "L6",
+    "L9",
+    "L12"
+  ],
+  "backbone_frozen": true,
+  "backbone_trainable_names": [],
+  "backbone_shared_with_decoder_adapter": true,
+  "official_spatial_prior_shapes": [
+    [
+      1,
+      384,
+      128,
+      128
+    ],
+    [
+      1,
+      4096,
+      384
+    ],
+    [
+      1,
+      1024,
+      384
+    ],
+    [
+      1,
+      256,
+      384
+    ]
+  ],
+  "official_adapter_output_shapes": [
+    [
+      1,
+      384,
+      128,
+      128
+    ],
+    [
+      1,
+      384,
+      64,
+      64
+    ],
+    [
+      1,
+      384,
+      32,
+      32
+    ],
+    [
+      1,
+      384,
+      16,
+      16
+    ]
+  ],
+  "feature_strides": [
+    4,
+    8,
+    16,
+    32
+  ],
+  "official_linear_head_logits_shape": [
+    1,
+    4,
+    128,
+    128
+  ],
+  "final_logits_shape": [
+    1,
+    4,
+    512,
+    512
+  ],
+  "backbone_parameters": 21601152,
+  "decoder_unique_parameters": 3707652,
+  "total_parameters": 25308804,
+  "trainable_parameters": 3707652,
+  "trainable_parameter_tensor_count": 161,
+  "optimizer": {
+    "name": "AdamW",
+    "lr": 0.0001,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "weight_decay": 0.0001,
+    "parameter_tensor_count": 161,
+    "parameter_names_first10": [
+      "decoder.adapter.level_embed",
+      "decoder.adapter.spm.stem.0.weight",
+      "decoder.adapter.spm.stem.1.weight",
+      "decoder.adapter.spm.stem.1.bias",
+      "decoder.adapter.spm.stem.3.weight",
+      "decoder.adapter.spm.stem.4.weight",
+      "decoder.adapter.spm.stem.4.bias",
+      "decoder.adapter.spm.stem.6.weight",
+      "decoder.adapter.spm.stem.7.weight",
+      "decoder.adapter.spm.stem.7.bias"
+    ],
+    "parameter_names_last10": [
+      "decoder.adapter.norm2.weight",
+      "decoder.adapter.norm2.bias",
+      "decoder.adapter.norm3.weight",
+      "decoder.adapter.norm3.bias",
+      "decoder.adapter.norm4.weight",
+      "decoder.adapter.norm4.bias",
+      "decoder.head.batchnorm_layer.weight",
+      "decoder.head.batchnorm_layer.bias",
+      "decoder.head.conv.weight",
+      "decoder.head.conv.bias"
+    ]
+  },
+  "loss": 1.4210158586502075,
+  "finite_forward_backward": true,
+  "forward_seconds_eval": 0.3899,
+  "forward_backward_seconds_probe": 0.179,
+  "memory": {
+    "allocated_mib": 138.07,
+    "reserved_mib": 908.0,
+    "peak_allocated_mib": 736.97
+  },
+  "test_accessed": false,
+  "optimizer_step_called": false,
+  "formal_training_started": false,
+  "sanity_check": "PASS"
+}

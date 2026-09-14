@@ -1,3 +1,7 @@
+import sys
+import types
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -2945,6 +2949,125 @@ class DPASADBaseDecoder(TPASADBaseDecoder):
         }
 
 
+class OfficialDINOv3AdapterDecoder(nn.Module):
+    """OSD wrapper around Meta's official DINOv3 segmentation adapter.
+
+    The adapter and its linear head are imported from the official DINOv3
+    checkout selected by ``runtime.load_backbone``.  This positive control does
+    not reuse the OSD TPA/PR/SAD path: it uses the official Spatial Prior
+    Module plus multi-scale deformable interaction, followed by the official
+    linear dense-prediction head adapted only to four OSD classes.
+
+    ViT-S has twelve blocks, so the official four-even-interval rule resolves
+    to zero-based interaction indices ``[2, 5, 8, 11]``.  All other adapter
+    arguments retain the official DINOv3 segmentation defaults.
+    """
+
+    def __init__(self, backbone, num_classes=4):
+        super().__init__()
+        try:
+            import dinov3
+
+            # DINOv3's released segmentation op uses the newer torch.amp
+            # decorator spelling.  PyTorch 2.2 exposes the equivalent CUDA
+            # decorators under torch.cuda.amp; bridge only the decorator API
+            # in-process so the official operator implementation is unchanged.
+            if not hasattr(torch.amp, "custom_fwd"):
+                from torch.cuda.amp import custom_bwd as _cuda_custom_bwd
+                from torch.cuda.amp import custom_fwd as _cuda_custom_fwd
+
+                def _compat_custom_fwd(fn=None, *, device_type=None, cast_inputs=None):
+                    decorator = lambda target: _cuda_custom_fwd(
+                        target, cast_inputs=cast_inputs
+                    )
+                    return decorator if fn is None else decorator(fn)
+
+                def _compat_custom_bwd(fn=None, *, device_type=None):
+                    decorator = lambda target: _cuda_custom_bwd(target)
+                    return decorator if fn is None else decorator(fn)
+
+                torch.amp.custom_fwd = _compat_custom_fwd
+                torch.amp.custom_bwd = _compat_custom_bwd
+
+            # The official setup.py places the compiled extension beside the
+            # official segmentation ops.  Make that directory importable for
+            # this process without copying or modifying the official source.
+            official_ops = (
+                Path(dinov3.__file__).resolve().parent
+                / "eval"
+                / "segmentation"
+                / "models"
+                / "utils"
+                / "ops"
+            )
+            if official_ops.is_dir() and str(official_ops) not in sys.path:
+                sys.path.insert(0, str(official_ops))
+            import MultiScaleDeformableAttention  # noqa: F401
+
+            # Importing the official adapter submodule through the normal
+            # package path executes the official segmentation registry first,
+            # which pulls the optional torchmetrics dependency.  The adapter
+            # and LinearHead themselves do not need that registry, so expose
+            # only the official package path for this import.
+            official_models = official_ops.parent.parent
+            package_name = "dinov3.eval.segmentation.models"
+            if package_name not in sys.modules:
+                package = types.ModuleType(package_name)
+                package.__path__ = [str(official_models)]
+                package.__package__ = package_name
+                sys.modules[package_name] = package
+
+            from dinov3.eval.segmentation.models.backbone.dinov3_adapter import (
+                DINOv3_Adapter,
+            )
+            from dinov3.eval.segmentation.models.heads.linear_head import LinearHead
+        except ImportError as exc:
+            raise ImportError(
+                "The official DINOv3 segmentation adapter is unavailable. "
+                "Ensure model.dino_repo points to the official DINOv3 checkout "
+                "and its MSDeformableAttention extension is installed."
+            ) from exc
+
+        if int(getattr(backbone, "n_blocks", 0)) != 12:
+            raise ValueError(
+                "The OSD positive control is configured for DINOv3-S/16 with "
+                f"12 blocks, got n_blocks={getattr(backbone, 'n_blocks', None)}"
+            )
+        embed_dim = int(backbone.embed_dim)
+        self.adapter = DINOv3_Adapter(
+            backbone,
+            interaction_indexes=[2, 5, 8, 11],
+            pretrain_size=512,
+            conv_inplane=64,
+            n_points=4,
+            deform_num_heads=16,
+            drop_path_rate=0.3,
+            init_values=0.0,
+            with_cffn=True,
+            cffn_ratio=0.25,
+            deform_ratio=0.5,
+            add_vit_feature=True,
+            use_extra_extractor=True,
+            with_cp=True,
+        )
+        # Official DINOv3 linear dense-prediction head; only the class count is
+        # adapted from the upstream segmentation task to OSD's four classes.
+        self.head = LinearHead(
+            in_channels=[embed_dim] * 4,
+            n_output_channels=int(num_classes),
+            use_batchnorm=True,
+            use_cls_token=False,
+            dropout=0.1,
+        )
+        self.output_feature_strides = (4, 8, 16, 32)
+        self.official_interaction_indexes = (2, 5, 8, 11)
+
+    def forward(self, x):
+        features = self.adapter(x)
+        ordered = [features[str(index)] for index in range(1, 5)]
+        return self.head(ordered)
+
+
 class DPT(nn.Module):
     def __init__(
         self,
@@ -3017,6 +3140,7 @@ class DPT(nn.Module):
             "l12_a_cross_see",
             "l12_a_cross_r_weighted",
             "l12_a_cross_r_dysample_splus",
+            "dinov3_adapter",
         }:
             raise ValueError(
                 f"Unknown decoder_variant '{self.decoder_variant}'. "
@@ -3103,6 +3227,11 @@ class DPT(nn.Module):
                 raise ValueError(f"{self.decoder_variant} uses the single final semantic source and requires layer_mapping=null")
             if self.wcf_enabled or adaptive_readout:
                 raise ValueError(f"{self.decoder_variant} cannot combine WCF or ALSR")
+        if self.decoder_variant == "dinov3_adapter":
+            if self.layer_mapping is not None:
+                raise ValueError("dinov3_adapter uses official [L3,L6,L9,L12] interactions and cannot remap layers")
+            if self.wcf_enabled or adaptive_readout:
+                raise ValueError("dinov3_adapter cannot combine WCF or ALSR")
         self.in_dims = [self.backbone.embed_dim] * 4
         self.spm_stem = (
             LiteSpatialPriorStem(in_channels=3, channels=(32, 64, 128))
@@ -3307,6 +3436,11 @@ class DPT(nn.Module):
                 num_classes=self.nclass,
                 edge_activation="tanh",
             )
+        elif self.decoder_variant == "dinov3_adapter":
+            self.decoder = OfficialDINOv3AdapterDecoder(
+                self.backbone,
+                num_classes=self.nclass,
+            )
         else:
             self.decoder = SameScaleMLPDecoder(
                 backbone_channels=self.backbone.embed_dim,
@@ -3400,7 +3534,10 @@ class DPT(nn.Module):
         patch_h, patch_w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         patch_embedding = None
         wcf_gates = []
-        if self.decoder_variant in CROSS_MSEF_VARIANTS:
+        if self.decoder_variant == "dinov3_adapter":
+            out = self.decoder(x)
+            returned_feature = None
+        elif self.decoder_variant in CROSS_MSEF_VARIANTS:
             final_layer_idx = self.intermediate_layer_idx[self.encoder_size][-1]
             if self._backbone_locked:
                 with torch.no_grad():
@@ -3468,7 +3605,7 @@ class DPT(nn.Module):
 
         if self.decoder_variant not in (
             SPM_VARIANTS | {"semantic_spatial"} | CROSS_MSEF_VARIANTS
-        ):
+        ) and self.decoder_variant != "dinov3_adapter":
             if self.wcf_enabled:
                 anchor = feats[-1]
                 supplemented = []

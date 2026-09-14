@@ -615,6 +615,14 @@ def run(
             f"decoder_variant={model_cfg.decoder_variant} "
             f"spatial_stride={model_cfg.spatial_stride}"
         )
+    elif model_cfg.decoder_variant == "dinov3_adapter":
+        log_print(
+            "decoder_variant=dinov3_adapter; official Meta DINOv3 Adapter with "
+            "RGB SpatialPriorModule, four-even-interval interactions "
+            "[2,5,8,11], multi-scale deformable attention, and official "
+            "LinearHead adapted to OSD four-class output; no TPA/PR/SAD; "
+            "official adapter internal autocast=bfloat16"
+        )
     elif model_cfg.decoder_variant == "tpa_sad_msef":
         log_print(
             "decoder_variant=tpa_sad_msef; TPA produces "
