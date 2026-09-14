@@ -1,6 +1,6 @@
 {
   "current_branch": "feat/osd-semantic-spatial-decoupling",
-  "current_commit": "2a1c4ef7d9352621af0ddd002b8fbe15f09760fc",
+  "current_commit": "3e3ba0811d9bceea17756961071ccf710b85a1ca",
   "config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_l12_spm_spsr_msmlp_osd_512.json",
   "model": "DINO-L12-SPM-SPSR-MSMLP-001",
   "decoder_variant": "l12_spsr_ms_mlp",
@@ -268,9 +268,9 @@
     0.0
   ],
   "gamma_after_one_optimizer_step": [
-    6.545302312588319e-05,
-    9.316142677562311e-05,
-    -9.157267049886286e-05
+    6.545310316141695e-05,
+    9.316138311987743e-05,
+    -9.157288150163367e-05
   ],
   "max_learned_offset_at_init_source_tokens": 0.0,
   "max_weight_sum_error": 1.1920928955078125e-07,
@@ -327,9 +327,9 @@
   "grid_sample_calls_per_forward": 3,
   "sampled_value_elements_b2": 176160768,
   "timing_seconds": {
-    "eval_decoder_plus_outer_forward": 0.3826,
-    "first_forward_backward": 0.2136,
-    "second_forward_backward": 0.0589
+    "eval_decoder_plus_outer_forward": 0.4094,
+    "first_forward_backward": 0.2142,
+    "second_forward_backward": 0.0575
   },
   "memory_after_preflight": {
     "allocated_mib": 7128.45,
@@ -339,9 +339,9 @@
   "first_backward": {
     "loss": 1.3867831230163574,
     "gamma_grad_norm": [
-      1.894609269470493e-08,
-      1.3622933181522967e-07,
-      1.0866165922607252e-07
+      1.8946158419907988e-08,
+      1.362281523142883e-07,
+      1.0866460797842592e-07
     ],
     "gamma_grad_finite": [
       true,
@@ -356,15 +356,15 @@
   "second_backward": {
     "loss": 1.3863035440444946,
     "gamma_grad_norm": [
-      1.822024131570288e-08,
-      1.3026124179305043e-07,
-      1.2860547826676338e-07
+      1.821748440988813e-08,
+      1.3025722012116603e-07,
+      1.2861173104283807e-07
     ],
-    "offset_final_weight_grad_norm": 3.358034683653699e-11,
-    "offset_final_bias_grad_norm": 3.512359500468243e-11,
+    "offset_final_weight_grad_norm": 3.3580676433997425e-11,
+    "offset_final_bias_grad_norm": 3.512084720269648e-11,
     "offset_hidden_grad_norm": 0.0,
-    "query_grad_norm": 2.8713311025704846e-13,
-    "key_grad_norm": 6.142109390538941e-13,
+    "query_grad_norm": 2.8713039975161725e-13,
+    "key_grad_norm": 6.141361833141012e-13,
     "offset_branch_finite": true,
     "compatibility_branch_finite": true
   },

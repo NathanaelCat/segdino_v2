@@ -35,7 +35,7 @@ was added.
 
 | Check | Result |
 |---|---:|
-| Branch / commit | `feat/osd-semantic-spatial-decoupling` / `2a1c4ef` |
+| Branch / implementation commit | `feat/osd-semantic-spatial-decoupling` / `3e3ba08` |
 | Input | `[2,3,512,512]` |
 | L12 patch tokens | `[2,1024,384]` |
 | Projected source map | `[2,256,32,32]` |
