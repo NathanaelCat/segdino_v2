@@ -29,6 +29,7 @@ L12_MSEF_VARIANTS = {
     "l12_a_cross_see",
     "l12_a_cross_r_weighted",
     "l12_a_cross_r_dysample_splus",
+    "l12_a_cross_ccse",
 }
 CROSS_MSEF_VARIANTS = {
     "l12_a_cross_msef",
@@ -42,6 +43,7 @@ CROSS_MSEF_VARIANTS = {
     "l12_a_cross_see",
     "l12_a_cross_r_weighted",
     "l12_a_cross_r_dysample_splus",
+    "l12_a_cross_ccse",
 }
 DEEP_SUPERVISION_VARIANTS = {"l12_a_cross_msef_ds"}
 
@@ -1124,6 +1126,163 @@ class L12ACrossRDecoder(L12ACrossMSEFDecoder):
                     seed,
                 ),
             )
+
+
+class CompactCrossScaleExchange(nn.Module):
+    """Exchange information across pyramid scales on a shared 32x32 lattice.
+
+    CCSE deliberately performs attention only over the four scale tokens at
+    each spatial location.  It never forms a spatial self-attention matrix.
+    The module is wrapped by zero-initialized per-scale residual coefficients
+    so that the complete decoder is exactly the parent decoder at
+    initialization.
+    """
+
+    def __init__(
+        self,
+        channels=256,
+        exchange_dim=64,
+        num_scales=4,
+        num_heads=4,
+    ):
+        super().__init__()
+        channels = int(channels)
+        exchange_dim = int(exchange_dim)
+        num_scales = int(num_scales)
+        num_heads = int(num_heads)
+        if channels <= 0 or exchange_dim <= 0 or num_scales != 4:
+            raise ValueError("CCSE expects positive channels/dim and exactly four scales")
+        if exchange_dim % num_heads != 0:
+            raise ValueError("CCSE exchange_dim must be divisible by num_heads")
+
+        self.channels = channels
+        self.exchange_dim = exchange_dim
+        self.num_scales = num_scales
+        self.num_heads = num_heads
+        self.head_dim = exchange_dim // num_heads
+
+        # Each scale gets its own channel basis after gathering to the common
+        # 32x32 lattice.  Biases are retained because the requested CCSE
+        # projection is an ordinary independent 1x1 projection.
+        self.input_projections = nn.ModuleList(
+            [nn.Conv2d(channels, exchange_dim, kernel_size=1, bias=True) for _ in range(num_scales)]
+        )
+        self.norm = nn.LayerNorm(exchange_dim)
+        self.qkv = nn.Linear(exchange_dim, 3 * exchange_dim, bias=True)
+        self.output_projection = nn.Linear(exchange_dim, exchange_dim, bias=True)
+        self.output_projections = nn.ModuleList(
+            [nn.Conv2d(exchange_dim, channels, kernel_size=1, bias=True) for _ in range(num_scales)]
+        )
+        self.gammas = nn.ParameterList(
+            [nn.Parameter(torch.zeros(1)) for _ in range(num_scales)]
+        )
+
+    @staticmethod
+    def _gather(feature, target_size=(32, 32)):
+        if feature.ndim != 4:
+            raise ValueError(f"CCSE expects BCHW features, got {tuple(feature.shape)}")
+        return (
+            feature
+            if tuple(feature.shape[-2:]) == tuple(target_size)
+            else F.adaptive_avg_pool2d(feature, output_size=target_size)
+        )
+
+    def forward(self, pyramid, return_trace=False):
+        if len(pyramid) != self.num_scales:
+            raise ValueError(f"CCSE expects four pyramid features, got {len(pyramid)}")
+        expected_channels = self.channels
+        if any(feature.shape[1] != expected_channels for feature in pyramid):
+            raise ValueError(
+                "CCSE channel mismatch: expected every scale to have "
+                f"{expected_channels} channels, got {[feature.shape[1] for feature in pyramid]}"
+            )
+
+        gathered = [self._gather(feature) for feature in pyramid]
+        projected = [
+            projection(feature)
+            for projection, feature in zip(self.input_projections, gathered)
+        ]
+        batch_size, _, height, width = projected[0].shape
+        # [B, 4, d, H, W] -> [B, H*W, 4, d].  The attention sequence is the
+        # scale axis (length four), not the spatial axis (length 1024).
+        tokens = torch.stack(projected, dim=1).permute(0, 3, 4, 1, 2)
+        tokens = tokens.reshape(batch_size, height * width, self.num_scales, self.exchange_dim)
+        normalized = self.norm(tokens)
+        qkv = self.qkv(normalized).reshape(
+            batch_size,
+            height * width,
+            self.num_scales,
+            3,
+            self.num_heads,
+            self.head_dim,
+        )
+        qkv = qkv.permute(3, 0, 1, 4, 2, 5)
+        query, key, value = qkv.unbind(0)
+        attention = torch.softmax(
+            torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5),
+            dim=-1,
+        )
+        exchanged = torch.matmul(attention, value)
+        exchanged = exchanged.transpose(2, 3).reshape(
+            batch_size, height * width, self.num_scales, self.exchange_dim
+        )
+        exchanged = tokens + self.output_projection(exchanged)
+        exchanged = exchanged.reshape(
+            batch_size, height, width, self.num_scales, self.exchange_dim
+        ).permute(0, 3, 4, 1, 2)
+
+        outputs = []
+        for index, (output_projection, gamma, original) in enumerate(
+            zip(self.output_projections, self.gammas, pyramid)
+        ):
+            correction = output_projection(exchanged[:, index])
+            if tuple(correction.shape[-2:]) != tuple(original.shape[-2:]):
+                correction = F.interpolate(
+                    correction,
+                    size=original.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            outputs.append(original + gamma * correction)
+
+        if return_trace:
+            return tuple(outputs), {
+                "input_shapes": [list(feature.shape) for feature in pyramid],
+                "gathered_shapes": [list(feature.shape) for feature in gathered],
+                "projected_shapes": [list(feature.shape) for feature in projected],
+                "token_shape": [batch_size, height * width, self.num_scales, self.exchange_dim],
+                "qkv_shape": [batch_size, height * width, self.num_scales, 3, self.num_heads, self.head_dim],
+                "attention_shape": list(attention.shape),
+                "distributed_shapes": [
+                    list(exchanged[:, index].shape) for index in range(self.num_scales)
+                ],
+                "output_shapes": [list(feature.shape) for feature in outputs],
+            }
+        return tuple(outputs)
+
+
+class L12ACrossCCSEDecoder(L12ACrossRDecoder):
+    """Cross-MSEF + CCSE followed by the unchanged original SAD/R path."""
+
+    CCSE_SEED = 54001
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed CCSE experiment requires decoder_channels=256")
+        self.ccse = _construct_with_fixed_seed(
+            lambda: CompactCrossScaleExchange(
+                channels=decoder_channels,
+                exchange_dim=64,
+                num_scales=4,
+                num_heads=4,
+            ),
+            self.CCSE_SEED,
+        )
+
+    def _forward_msef_sad(self, pyramid):
+        exchanged = self.ccse(pyramid)
+        return super()._forward_msef_sad(exchanged)
 
 
 class DWECABlock(nn.Module):
@@ -3950,6 +4109,7 @@ class DPT(nn.Module):
             "l12_a_cross_see",
             "l12_a_cross_r_weighted",
             "l12_a_cross_r_dysample_splus",
+            "l12_a_cross_ccse",
             "dinov3_adapter",
         }:
             raise ValueError(
@@ -4217,6 +4377,12 @@ class DPT(nn.Module):
             )
         elif self.decoder_variant == "l12_a_cross_r":
             self.decoder = L12ACrossRDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_ccse":
+            self.decoder = L12ACrossCCSEDecoder(
                 self.in_dims,
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,
