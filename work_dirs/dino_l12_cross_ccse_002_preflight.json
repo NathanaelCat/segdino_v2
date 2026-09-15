@@ -1,0 +1,297 @@
+{
+  "preflight": "PASS",
+  "formal_training_started": false,
+  "test_accessed": false,
+  "config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_l12_spm_cross_msef_ccse_002.json",
+  "parent_config": "/home/zhengshijie/workspace/OSD/segdino_v2/configs/dino_l12_spm_cross_r_osd_512.json",
+  "candidate_variant": "l12_a_cross_ccse_nop2",
+  "parent_variant": "l12_a_cross_r",
+  "device": "cuda:1",
+  "seed": 20260901,
+  "config_diff_allowed_only": true,
+  "common_init_max_abs_diff": 0.0,
+  "identity_max_abs_diff_vs_fresh_parent": 0.0,
+  "p2_passthrough_max_abs_diff": 0.0,
+  "identity_pass": true,
+  "shape_trace": {
+    "ccse_input": [
+      [
+        1,
+        256,
+        256,
+        256
+      ],
+      [
+        1,
+        256,
+        128,
+        128
+      ],
+      [
+        1,
+        256,
+        64,
+        64
+      ],
+      [
+        1,
+        256,
+        32,
+        32
+      ]
+    ],
+    "ccse_gathered": [
+      [
+        1,
+        256,
+        32,
+        32
+      ],
+      [
+        1,
+        256,
+        32,
+        32
+      ],
+      [
+        1,
+        256,
+        32,
+        32
+      ],
+      [
+        1,
+        256,
+        32,
+        32
+      ]
+    ],
+    "ccse_projected": [
+      [
+        1,
+        64,
+        32,
+        32
+      ],
+      [
+        1,
+        64,
+        32,
+        32
+      ],
+      [
+        1,
+        64,
+        32,
+        32
+      ],
+      [
+        1,
+        64,
+        32,
+        32
+      ]
+    ],
+    "tokens": [
+      1,
+      1024,
+      4,
+      64
+    ],
+    "qkv": [
+      1,
+      1024,
+      4,
+      3,
+      4,
+      16
+    ],
+    "attention": [
+      1,
+      1024,
+      4,
+      4,
+      4
+    ],
+    "distributed": [
+      [
+        1,
+        64,
+        32,
+        32
+      ],
+      [
+        1,
+        64,
+        32,
+        32
+      ],
+      [
+        1,
+        64,
+        32,
+        32
+      ],
+      [
+        1,
+        64,
+        32,
+        32
+      ]
+    ],
+    "writeback_indices": [
+      1,
+      2,
+      3
+    ],
+    "ccse_outputs": [
+      [
+        1,
+        256,
+        256,
+        256
+      ],
+      [
+        1,
+        256,
+        128,
+        128
+      ],
+      [
+        1,
+        256,
+        64,
+        64
+      ],
+      [
+        1,
+        256,
+        32,
+        32
+      ]
+    ],
+    "logits": [
+      1,
+      4,
+      512,
+      512
+    ]
+  },
+  "module_counts": {
+    "ccse": 1,
+    "cross_msef": 3,
+    "original_sad_r": 8,
+    "writeback_scales": 3
+  },
+  "backbone_frozen": true,
+  "patch_embed_frozen": true,
+  "backbone_trainable_names": [],
+  "params": {
+    "candidate_total": 22592071,
+    "candidate_backbone": 21601152,
+    "candidate_decoder_and_stem": 990919,
+    "candidate_trainable": 990919,
+    "parent_total": 22459588,
+    "parent_backbone": 21601152,
+    "parent_decoder_and_stem": 858436,
+    "parent_trainable": 858436,
+    "ccse_total": 132483,
+    "ccse_trainable": 132483,
+    "candidate_minus_parent_total": 132483,
+    "candidate_minus_parent_trainable": 132483,
+    "ccse_trainable_parameter_names": [
+      "decoder.ccse.input_projections.0.weight",
+      "decoder.ccse.input_projections.0.bias",
+      "decoder.ccse.input_projections.1.weight",
+      "decoder.ccse.input_projections.1.bias",
+      "decoder.ccse.input_projections.2.weight",
+      "decoder.ccse.input_projections.2.bias",
+      "decoder.ccse.input_projections.3.weight",
+      "decoder.ccse.input_projections.3.bias",
+      "decoder.ccse.norm.weight",
+      "decoder.ccse.norm.bias",
+      "decoder.ccse.qkv.weight",
+      "decoder.ccse.qkv.bias",
+      "decoder.ccse.output_projection.weight",
+      "decoder.ccse.output_projection.bias",
+      "decoder.ccse.output_projections.0.weight",
+      "decoder.ccse.output_projections.0.bias",
+      "decoder.ccse.output_projections.1.weight",
+      "decoder.ccse.output_projections.1.bias",
+      "decoder.ccse.output_projections.2.weight",
+      "decoder.ccse.output_projections.2.bias",
+      "decoder.ccse.gammas.0",
+      "decoder.ccse.gammas.1",
+      "decoder.ccse.gammas.2"
+    ]
+  },
+  "gradient_checks": {
+    "first_backward_gamma_grad_norms": [
+      0.011512833647429943,
+      0.013146588578820229,
+      0.005579009652137756
+    ],
+    "first_backward_internal_grad_norms": {
+      "input_projections": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "qkv": 0.0,
+      "output_projection": 0.0,
+      "output_projections": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "gamma_after_one_ccse_step": [
+      9.999991743825376e-05,
+      -9.999992471421137e-05,
+      -9.999983012676239e-05
+    ],
+    "second_backward_internal_grad_norms": {
+      "input_projections": [
+        1.6004078133846633e-05,
+        2.156009759346489e-05,
+        2.343797495996114e-05,
+        2.6759369575302117e-05
+      ],
+      "qkv": 2.0454457626328804e-05,
+      "output_projection": 1.9720742784556933e-05,
+      "output_projections": [
+        1.771741153788753e-05,
+        1.4967850802349858e-05,
+        1.2782415069523267e-05
+      ]
+    },
+    "finite_gradients": true
+  },
+  "benchmark": {
+    "candidate": {
+      "steps": 200,
+      "warmup_steps": 10,
+      "batch_size": 8,
+      "elapsed_seconds": 47.89370528701693,
+      "seconds_per_step": 0.23946852643508465,
+      "estimated_5100_step_minutes": 20.354824746982196,
+      "peak_memory_mib": 14943.06591796875
+    },
+    "parent": {
+      "steps": 200,
+      "warmup_steps": 10,
+      "batch_size": 8,
+      "elapsed_seconds": 46.08452610205859,
+      "seconds_per_step": 0.23042263051029294,
+      "estimated_5100_step_minutes": 19.5859235933749,
+      "peak_memory_mib": 14523.28955078125
+    },
+    "candidate_over_parent_latency_ratio": 1.0392578450508907,
+    "candidate_minus_parent_peak_memory_mib": 419.7763671875,
+    "latency_threshold_ratio": 1.1,
+    "memory_threshold_delta_mib": 512.0,
+    "latency_pass": true,
+    "memory_pass": true
+  }
+}

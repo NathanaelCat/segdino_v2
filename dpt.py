@@ -30,6 +30,7 @@ L12_MSEF_VARIANTS = {
     "l12_a_cross_r_weighted",
     "l12_a_cross_r_dysample_splus",
     "l12_a_cross_ccse",
+    "l12_a_cross_ccse_nop2",
 }
 CROSS_MSEF_VARIANTS = {
     "l12_a_cross_msef",
@@ -44,6 +45,7 @@ CROSS_MSEF_VARIANTS = {
     "l12_a_cross_r_weighted",
     "l12_a_cross_r_dysample_splus",
     "l12_a_cross_ccse",
+    "l12_a_cross_ccse_nop2",
 }
 DEEP_SUPERVISION_VARIANTS = {"l12_a_cross_msef_ds"}
 
@@ -1144,6 +1146,7 @@ class CompactCrossScaleExchange(nn.Module):
         exchange_dim=64,
         num_scales=4,
         num_heads=4,
+        writeback_indices=None,
     ):
         super().__init__()
         channels = int(channels)
@@ -1154,12 +1157,26 @@ class CompactCrossScaleExchange(nn.Module):
             raise ValueError("CCSE expects positive channels/dim and exactly four scales")
         if exchange_dim % num_heads != 0:
             raise ValueError("CCSE exchange_dim must be divisible by num_heads")
+        if writeback_indices is None:
+            writeback_indices = tuple(range(num_scales))
+        else:
+            writeback_indices = tuple(int(index) for index in writeback_indices)
+        if not writeback_indices or any(
+            index < 0 or index >= num_scales for index in writeback_indices
+        ) or len(set(writeback_indices)) != len(writeback_indices):
+            raise ValueError(
+                "CCSE writeback_indices must be a non-empty tuple of unique valid scale indices"
+            )
 
         self.channels = channels
         self.exchange_dim = exchange_dim
         self.num_scales = num_scales
         self.num_heads = num_heads
         self.head_dim = exchange_dim // num_heads
+        self.writeback_indices = writeback_indices
+        self._writeback_slots = {
+            index: slot for slot, index in enumerate(writeback_indices)
+        }
 
         # Each scale gets its own channel basis after gathering to the common
         # 32x32 lattice.  Biases are retained because the requested CCSE
@@ -1171,10 +1188,13 @@ class CompactCrossScaleExchange(nn.Module):
         self.qkv = nn.Linear(exchange_dim, 3 * exchange_dim, bias=True)
         self.output_projection = nn.Linear(exchange_dim, exchange_dim, bias=True)
         self.output_projections = nn.ModuleList(
-            [nn.Conv2d(exchange_dim, channels, kernel_size=1, bias=True) for _ in range(num_scales)]
+            [
+                nn.Conv2d(exchange_dim, channels, kernel_size=1, bias=True)
+                for _ in self.writeback_indices
+            ]
         )
         self.gammas = nn.ParameterList(
-            [nn.Parameter(torch.zeros(1)) for _ in range(num_scales)]
+            [nn.Parameter(torch.zeros(1)) for _ in self.writeback_indices]
         )
 
     @staticmethod
@@ -1232,9 +1252,16 @@ class CompactCrossScaleExchange(nn.Module):
         ).permute(0, 3, 4, 1, 2)
 
         outputs = []
-        for index, (output_projection, gamma, original) in enumerate(
-            zip(self.output_projections, self.gammas, pyramid)
-        ):
+        for index, original in enumerate(pyramid):
+            if index not in self._writeback_slots:
+                # The scale still participated in the shared exchange above,
+                # but this asymmetric variant deliberately keeps P2 exactly
+                # unchanged at the output interface.
+                outputs.append(original)
+                continue
+            slot = self._writeback_slots[index]
+            output_projection = self.output_projections[slot]
+            gamma = self.gammas[slot]
             correction = output_projection(exchanged[:, index])
             if tuple(correction.shape[-2:]) != tuple(original.shape[-2:]):
                 correction = F.interpolate(
@@ -1253,6 +1280,7 @@ class CompactCrossScaleExchange(nn.Module):
                 "token_shape": [batch_size, height * width, self.num_scales, self.exchange_dim],
                 "qkv_shape": [batch_size, height * width, self.num_scales, 3, self.num_heads, self.head_dim],
                 "attention_shape": list(attention.shape),
+                "writeback_indices": list(self.writeback_indices),
                 "distributed_shapes": [
                     list(exchanged[:, index].shape) for index in range(self.num_scales)
                 ],
@@ -1276,6 +1304,31 @@ class L12ACrossCCSEDecoder(L12ACrossRDecoder):
                 exchange_dim=64,
                 num_scales=4,
                 num_heads=4,
+            ),
+            self.CCSE_SEED,
+        )
+
+    def _forward_msef_sad(self, pyramid):
+        exchanged = self.ccse(pyramid)
+        return super()._forward_msef_sad(exchanged)
+
+
+class L12ACrossCCSENoP2Decoder(L12ACrossRDecoder):
+    """CCSE-002: all scales exchange, but only P4/P8/P16 write back."""
+
+    CCSE_SEED = 54002
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed CCSE-002 experiment requires decoder_channels=256")
+        self.ccse = _construct_with_fixed_seed(
+            lambda: CompactCrossScaleExchange(
+                channels=decoder_channels,
+                exchange_dim=64,
+                num_scales=4,
+                num_heads=4,
+                writeback_indices=(1, 2, 3),
             ),
             self.CCSE_SEED,
         )
@@ -4110,6 +4163,7 @@ class DPT(nn.Module):
             "l12_a_cross_r_weighted",
             "l12_a_cross_r_dysample_splus",
             "l12_a_cross_ccse",
+            "l12_a_cross_ccse_nop2",
             "dinov3_adapter",
         }:
             raise ValueError(
@@ -4383,6 +4437,12 @@ class DPT(nn.Module):
             )
         elif self.decoder_variant == "l12_a_cross_ccse":
             self.decoder = L12ACrossCCSEDecoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_ccse_nop2":
+            self.decoder = L12ACrossCCSENoP2Decoder(
                 self.in_dims,
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,
