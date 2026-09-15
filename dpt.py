@@ -22,6 +22,7 @@ L12_MSEF_VARIANTS = {
     "l12_a_cross_r",
     "l12_a_cross_dweca",
     "l12_a_cross_bottleneck64",
+    "l12_a_cross_lowrank64",
     "l12_a_cross_msef_cdr",
     "l12_a_cross_msef_ds",
     "l12_a_cross_ee",
@@ -34,6 +35,7 @@ CROSS_MSEF_VARIANTS = {
     "l12_a_cross_r",
     "l12_a_cross_dweca",
     "l12_a_cross_bottleneck64",
+    "l12_a_cross_lowrank64",
     "l12_a_cross_msef_cdr",
     "l12_a_cross_msef_ds",
     "l12_a_cross_ee",
@@ -1272,6 +1274,78 @@ class L12ACrossBottleneck64Decoder(L12ACrossMSEFDecoder):
             )
 
 
+class LowRankResidualBlock(nn.Module):
+    """Strict linear rank-64 factorization of the R pointwise mixer.
+
+    The block keeps R's depthwise convolution, post-mixer GroupNorm/GELU, and
+    zero-initialized scalar residual scale.  Only the dense 256->256 pointwise
+    mixer is replaced by a linear 256->64->256 factorization; there is no GELU
+    between the two pointwise projections.
+    """
+
+    def __init__(self, channels=256, rank=64, groups=32):
+        super().__init__()
+        channels = int(channels)
+        rank = int(rank)
+        groups = int(groups)
+        if channels <= 0 or rank <= 0 or groups <= 0:
+            raise ValueError("channels, rank, and groups must be positive")
+        if channels % groups != 0:
+            raise ValueError("channels must be divisible by groups")
+        self.channels = channels
+        self.rank = rank
+        self.depthwise = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1,
+            groups=channels, bias=False
+        )
+        self.down = nn.Conv2d(channels, rank, kernel_size=1, bias=False)
+        self.up = nn.Conv2d(rank, channels, kernel_size=1, bias=False)
+        self.norm = nn.GroupNorm(groups, channels)
+        self.act = nn.GELU()
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError(
+                f"LowRankResidualBlock expected [B,{self.channels},H,W], "
+                f"got {tuple(x.shape)}"
+            )
+        residual = self.up(self.down(self.depthwise(x)))
+        residual = self.act(self.norm(residual))
+        return x + self.gamma * residual
+
+
+class L12ACrossLowRank64Decoder(L12ACrossMSEFDecoder):
+    """Cross-MSEF front-end with uniform strict linear rank-64 SAD blocks."""
+
+    LOWRANK_SEEDS = {
+        "sad_intra_1": 53001,
+        "sad_intra_2": 53002,
+        "sad_intra_3": 53003,
+        "sad_intra_4": 53004,
+        "sad_inter_4": 53005,
+        "sad_inter_3": 53006,
+        "sad_inter_2": 53007,
+        "sad_inter_1": 53008,
+    }
+
+    def __init__(self, in_dims, decoder_channels=256, num_classes=4):
+        super().__init__(in_dims, decoder_channels=decoder_channels, num_classes=num_classes)
+        if int(decoder_channels) != 256:
+            raise ValueError("The prescribed low-rank experiment requires decoder_channels=256")
+        for name, seed in self.LOWRANK_SEEDS.items():
+            setattr(
+                self,
+                name,
+                _construct_with_fixed_seed(
+                    lambda: LowRankResidualBlock(
+                        decoder_channels, rank=64, groups=32
+                    ),
+                    seed,
+                ),
+            )
+
+
 class OfficialDySample(nn.Module):
     """Official DySample operator kept local to the OSD runner.
 
@@ -1829,6 +1903,79 @@ class SameScaleMLPDecoder(nn.Module):
         projected = [projection(feature) for projection, feature in zip(self.projections, maps)]
         fused = self.activation(self.fusion(torch.cat(projected, dim=1)))
         return self.classifier(fused)
+
+
+class OfficialOffsetLearningHead(nn.Module):
+    """Direct OSD-compatible port of OffSeg's ``Offset_Learning`` head.
+
+    Source: HVision-NKU/OffSeg, commit ``a203f52`` (ICCV 2025).  This head is
+    used only as a diagnostic replacement for the final classifier: the
+    preceding Cross-MSEF + SAD-R representation remains frozen.  The official
+    implementation keeps a learnable global class representation and applies
+    coupled class/feature offset projections before producing class logits.
+    """
+
+    def __init__(self, num_classes=4, embed_dims=256, init_std=0.02):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.embed_dims = int(embed_dims)
+        self.init_std = float(init_std)
+        self.cls_repr = nn.Parameter(
+            torch.empty(1, self.num_classes, self.embed_dims)
+        )
+        # The official mmcv ``build_norm_layer(dict(type='LN'), num_classes)``
+        # is equivalent to an affine LayerNorm over the class dimension.
+        self.mask_norm = nn.LayerNorm(self.num_classes)
+        self.cls_offset_proj = nn.Linear(
+            self.embed_dims, self.embed_dims, bias=False
+        )
+        self.feat_offset_proj = nn.Linear(
+            self.embed_dims, self.embed_dims, bias=False
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.trunc_normal_(self.cls_repr, std=self.init_std)
+        nn.init.trunc_normal_(self.cls_offset_proj.weight, std=self.init_std)
+        nn.init.trunc_normal_(self.feat_offset_proj.weight, std=self.init_std)
+        nn.init.ones_(self.mask_norm.weight)
+        nn.init.zeros_(self.mask_norm.bias)
+
+    def forward(self, x):
+        if x.ndim != 4:
+            raise ValueError(
+                f"OfficialOffsetLearningHead expects BCHW input, got {tuple(x.shape)}"
+            )
+        batch_size, channels, height, width = x.shape
+        if channels != self.embed_dims:
+            raise ValueError(
+                f"OfficialOffsetLearningHead channel mismatch: got {channels}, "
+                f"expected {self.embed_dims}"
+            )
+
+        cls_repr = self.cls_repr.expand(batch_size, -1, -1)  # B,K,C
+        img_feat = x.permute(0, 2, 3, 1).contiguous().view(
+            batch_size, height * width, channels
+        )  # B,HW,C
+
+        coupled_attn = img_feat @ cls_repr.transpose(1, 2)  # B,HW,K
+        coupled_attn = coupled_attn.permute(0, 2, 1)  # B,K,HW
+
+        cls_attn = coupled_attn.softmax(dim=2)
+        cls_offset = self.cls_offset_proj(cls_attn @ img_feat)  # B,K,C
+        aligned_cls_repr = cls_repr + cls_offset
+
+        pos_attn = coupled_attn.softmax(dim=1)
+        feat_offset = self.feat_offset_proj(
+            pos_attn.transpose(1, 2) @ cls_repr
+        )  # B,HW,C
+        aligned_img_feat = img_feat + feat_offset
+
+        masks = aligned_img_feat @ aligned_cls_repr.transpose(1, 2)  # B,HW,K
+        masks = self.mask_norm(masks)
+        return masks.permute(0, 2, 1).contiguous().view(
+            batch_size, self.num_classes, height, width
+        )
 
 
 class MultiScaleMLPFusion(nn.Module):
@@ -3796,6 +3943,7 @@ class DPT(nn.Module):
             "l12_a_cross_r",
             "l12_a_cross_dweca",
             "l12_a_cross_bottleneck64",
+            "l12_a_cross_lowrank64",
             "l12_a_cross_msef_cdr",
             "l12_a_cross_msef_ds",
             "l12_a_cross_ee",
@@ -4081,6 +4229,12 @@ class DPT(nn.Module):
             )
         elif self.decoder_variant == "l12_a_cross_bottleneck64":
             self.decoder = L12ACrossBottleneck64Decoder(
+                self.in_dims,
+                decoder_channels=decoder_channels,
+                num_classes=self.nclass,
+            )
+        elif self.decoder_variant == "l12_a_cross_lowrank64":
+            self.decoder = L12ACrossLowRank64Decoder(
                 self.in_dims,
                 decoder_channels=decoder_channels,
                 num_classes=self.nclass,

@@ -712,6 +712,14 @@ def run(
             "GELU) with zero-initialized scalar gamma; no checkpoint "
             "initialization"
         )
+    elif model_cfg.decoder_variant == "l12_a_cross_lowrank64":
+        log_print(
+            "decoder_variant=l12_a_cross_lowrank64; Cross-MSEF front-end is "
+            "unchanged; all eight SAD positions use strict linear rank-64 "
+            "pointwise factorization (DWConv + PW 256->64->256 + GroupNorm + "
+            "GELU) with zero-initialized scalar gamma; no bottleneck GELU and "
+            "no checkpoint initialization"
+        )
     elif model_cfg.decoder_variant == "l12_a_cross_msef_cdr":
         log_print(
             "decoder_variant=l12_a_cross_msef_cdr; Cross-MSEF front-end is unchanged; "
